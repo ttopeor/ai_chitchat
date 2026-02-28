@@ -111,6 +111,9 @@ class BrainEngine:
         # Conversation boundary tracking
         self._conversation_history_snapshot: list[dict] | None = None
 
+        # Dynamic background (synthesized from memory at startup, refreshed on new memories)
+        self._dynamic_background: str = ""
+
         # Think cycle counter (for log filenames)
         self._think_count = 0
 
@@ -164,6 +167,48 @@ class BrainEngine:
             await self._think()
         except Exception as e:
             print(f"[Brain] initial think error: {e}")
+
+    def get_dynamic_background(self) -> str:
+        """Return the current dynamic background text for SYSTEM_PROMPT."""
+        return self._dynamic_background
+
+    async def synthesize_dynamic_background(self) -> None:
+        """Synthesize a dynamic user background from high-importance memories.
+
+        Called at startup and after new memories are extracted.
+        Uses LLM to condense memory entries into a natural paragraph.
+        Falls back to formatted memory list if LLM call fails.
+        """
+        if not self._memory:
+            return
+
+        profile_memories = self._memory.get_profile_memories()
+        if not profile_memories:
+            self._dynamic_background = ""
+            return
+
+        # Format memories for the synthesis prompt
+        mem_lines = [
+            f"- [{m.category}] {m.content}（{m.source}）"
+            for m in profile_memories
+        ]
+        mem_text = "\n".join(mem_lines)
+
+        prompt = config.PROFILE_SYNTHESIS_PROMPT.format(memories=mem_text)
+
+        try:
+            result, _ = await self._call_ollama(prompt, image_b64=None)
+            if result and len(result.strip()) > 5:
+                self._dynamic_background = result.strip()
+                print(f"[Brain] Dynamic background synthesized ({len(self._dynamic_background)} chars)")
+            else:
+                # Fallback: use raw memory list
+                self._dynamic_background = mem_text
+                print(f"[Brain] Dynamic background fallback (raw memories)")
+        except Exception as e:
+            print(f"[Brain] Dynamic background synthesis error: {e}")
+            # Fallback: use raw memory list
+            self._dynamic_background = mem_text
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -487,6 +532,9 @@ class BrainEngine:
             query = " ".join(recent_topics)
             async with self._lock:
                 self._brief.memories = self._memory.format_for_prompt(query)
+
+            # Refresh dynamic background with new memories
+            await self.synthesize_dynamic_background()
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

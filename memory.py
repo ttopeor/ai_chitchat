@@ -266,6 +266,19 @@ class MemoryManager:
             self._save_all()
         return removed
 
+    # ── profile memories (for dynamic background synthesis) ───────────────────
+
+    def get_profile_memories(self) -> list[MemoryEntry]:
+        """Return high-importance memories sorted by importance desc.
+
+        Used by BrainEngine to synthesize a dynamic user background
+        at startup and after new memories are extracted.
+        """
+        min_imp = config.PROFILE_MIN_IMPORTANCE
+        profile = [m for m in self._memories if m.importance >= min_imp]
+        profile.sort(key=lambda m: m.importance, reverse=True)
+        return profile
+
     # ── context injection ─────────────────────────────────────────────────────
 
     def format_for_prompt(self, query: str = "") -> str:

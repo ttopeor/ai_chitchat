@@ -460,8 +460,10 @@ class VoiceBot:
         budget = config.MODEL_NUM_CTX
         output_reserve = config.CONV_OUTPUT_RESERVE
 
-        # Fixed: system prompt
-        sys_tokens = _estimate_tokens(config.SYSTEM_PROMPT)
+        # System prompt with dynamic background injected
+        dynamic_bg = self.brain.get_dynamic_background() if self.brain else ""
+        system_prompt = config.SYSTEM_PROMPT.replace("{dynamic_background}", dynamic_bg)
+        sys_tokens = _estimate_tokens(system_prompt)
 
         # Build brain context block (truncate each part to control size)
         brain_context = ""
@@ -507,7 +509,7 @@ class VoiceBot:
 
         # Assemble final messages
         messages: list[dict] = [
-            {"role": "system", "content": config.SYSTEM_PROMPT}
+            {"role": "system", "content": system_prompt}
         ]
 
         if brain_context and trimmed:
@@ -788,6 +790,10 @@ class VoiceBot:
             removed = self.memory.consolidate()
             print(f"  Memories loaded: {self.memory.count}"
                   + (f" ({removed} old entries pruned)" if removed else ""))
+
+        # Synthesize dynamic background from memories (before first think)
+        if self.brain:
+            await self.brain.synthesize_dynamic_background()
 
         # Initial brain think (so it has context before first conversation)
         if self.brain:
