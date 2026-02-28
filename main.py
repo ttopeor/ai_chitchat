@@ -1,7 +1,7 @@
 """
 VoiceBot — dual-system voice chat with vision, memory, and autonomous speech.
 
-  System 1 (7b) : fast real-time conversation — mouth & reflexes
+  System 1 (32b): real-time conversation — mouth & reflexes
   System 2 (72b): background thinker — vision, memory, context generation
 
   STT : faster-whisper  (CUDA)
@@ -101,6 +101,21 @@ def _log_conv(role: str, text: str, **extra):
     }
     with open(_conv_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# ── token estimation ─────────────────────────────────────────────────────────
+
+def _estimate_tokens(text: str) -> int:
+    """Token count estimate for Qwen2.5 models (~1.3x safety margin).
+
+    Qwen2.5 tokenizer: CJK ≈ 0.73 tok/char, ASCII ≈ 0.25 tok/char.
+    We use 1.0/0.3 for ~1.3x overestimate to avoid overflow.
+    """
+    if not text:
+        return 0
+    n_cjk = sum(1 for c in text if ord(c) > 0x2E7F)
+    n_other = len(text) - n_cjk
+    return int(n_cjk * 1.0 + n_other * 0.3) + 4   # +4 per-message overhead
 
 
 # ── sentence splitter ─────────────────────────────────────────────────────────
@@ -418,33 +433,86 @@ class VoiceBot:
 
     # ── message building ─────────────────────────────────────────────────────
 
-    def _build_messages(self, current_text: str) -> list[dict]:
-        """Build message list for the 7b model, enriched with brain context."""
-        # Start with base system prompt
-        system_content = config.SYSTEM_PROMPT
+    def _build_messages(self, extra_user_msg: str | None = None) -> list[dict]:
+        """Build message list for the conv model, fitting within CONV_NUM_CTX.
 
-        # Inject brain's context brief (vision + memory + mood)
+        Token budget: system_prompt + brain_context + history + output_reserve
+        must fit within CONV_NUM_CTX.  History is trimmed from oldest first.
+
+        Structure:
+          [system] character prompt (static)
+          [user/assistant] trimmed conversation history ...
+          [system] brain context (scene + guide) ← injected LATE
+          [user] latest message (from history or extra_user_msg)
+        """
+        budget = config.CONV_NUM_CTX
+        output_reserve = 200  # tokens reserved for model's reply
+
+        # Fixed: system prompt
+        sys_tokens = _estimate_tokens(config.SYSTEM_PROMPT)
+
+        # Build brain context block (truncate each part to control size)
+        brain_context = ""
+        brain_tokens = 0
         if self.brain:
             brief = self.brain.get_context_brief()
             parts: list[str] = []
             if brief.scene:
-                parts.append(f"你看到: {brief.scene}")
+                parts.append(f"你看到: {brief.scene[:120]}")
             if brief.memories:
-                parts.append(f"你记得的事:\n{brief.memories}")
-            if brief.mood_hint:
-                parts.append(f"你的判断: {brief.mood_hint}")
-            if brief.suggested_topics:
-                parts.append(f"可以聊: {brief.suggested_topics}")
+                mem = brief.memories[:200] if len(brief.memories) > 200 else brief.memories
+                parts.append(f"你记得的事: {mem}")
+            if brief.conversation_guide:
+                parts.append(f"你的想法: {brief.conversation_guide[:150]}")
             if parts:
-                system_content += (
-                    "\n\n【你现在的感知】\n"
+                brain_context = (
+                    "【感知】\n"
                     + "\n".join(parts)
-                    + "\n自然地融入这些信息，不要刻意说'我看到'或'我记得'。"
+                    + "\n自然回应，不要说'我看到'、'画面中'。"
                 )
+                brain_tokens = _estimate_tokens(brain_context)
 
-        messages: list[dict] = [{"role": "system", "content": system_content}]
-        # Append conversation history (skip the original system prompt entry)
-        messages.extend(self.history[1:])
+        # Extra user message for autonomous speech
+        extra_tokens = _estimate_tokens(extra_user_msg) if extra_user_msg else 0
+
+        # Available budget for conversation history
+        available = budget - sys_tokens - brain_tokens - extra_tokens - output_reserve
+        available = max(available, 0)
+
+        # Trim history to fit (keep most recent messages)
+        history = self.history[1:]  # skip system prompt entry
+        trimmed: list[dict] = []
+        used = 0
+        dropped = 0
+        for msg in reversed(history):
+            msg_tokens = _estimate_tokens(msg["content"])
+            if used + msg_tokens > available:
+                dropped += 1
+                continue   # try older messages too — skip long ones
+            trimmed.insert(0, msg)
+            used += msg_tokens
+
+        total_est = sys_tokens + brain_tokens + extra_tokens + used + output_reserve
+        if dropped:
+            print(f"  [ctx] ~{total_est}/{budget}tok (dropped {dropped} old msgs)")
+
+        # Assemble final messages
+        messages: list[dict] = [
+            {"role": "system", "content": config.SYSTEM_PROMPT}
+        ]
+
+        if brain_context and trimmed:
+            # Insert brain context right before the last user/auto message
+            messages.extend(trimmed[:-1])
+            messages.append({"role": "system", "content": brain_context})
+            messages.append(trimmed[-1])
+        else:
+            messages.extend(trimmed)
+
+        # Autonomous speech: append the intent prompt as user message
+        if extra_user_msg:
+            messages.append({"role": "user", "content": extra_user_msg})
+
         return messages
 
     # ── stream LLM + TTS (shared by process_loop and autonomous speech) ──────
@@ -452,7 +520,7 @@ class VoiceBot:
     async def _stream_and_speak(
         self, messages: list[dict], label: str = "bot"
     ) -> str:
-        """Stream tokens from 7b via native Ollama API, split into sentences, pipe to TTS.
+        """Stream tokens from conv model via native Ollama API, split into sentences, pipe to TTS.
         Returns the full generated text.
 
         Uses /api/chat with num_ctx to prevent Ollama from reloading the model
@@ -474,7 +542,10 @@ class VoiceBot:
             body = {
                 "model": config.CONV_MODEL,
                 "messages": messages,
-                "options": {"num_ctx": config.CONV_NUM_CTX},
+                "options": {
+                    "num_ctx": config.CONV_NUM_CTX,
+                    "num_predict": 100,   # ~2 Chinese sentences; hard cap to enforce brevity
+                },
                 "stream": True,
             }
             async with httpx.AsyncClient() as client:
@@ -571,7 +642,7 @@ class VoiceBot:
             self.history.append({"role": "user", "content": text})
 
             # Build messages with brain context and generate response
-            messages = self._build_messages(text)
+            messages = self._build_messages()
 
             async with self._speech_lock:
                 full = await self._stream_and_speak(messages, label="bot")
@@ -588,20 +659,21 @@ class VoiceBot:
     # ── autonomous speech (triggered by brain) ────────────────────────────────
 
     async def _handle_autonomous_speech(self, intent: str) -> None:
-        """Brain decided to speak — generate actual words via 7b."""
+        """Brain decided to speak — generate actual words via conv model."""
         if self.bot_speaking.is_set():
             return
 
         _log_conv("system", f"autonomous speech triggered: {intent}")
 
+        # Truncate long intents to save tokens
+        short_intent = intent[:100] if len(intent) > 100 else intent
         prompt = (
-            f"（你注意到了一些事情，想主动说点什么。\n"
-            f"你的想法: {intent}\n"
-            f"自然地说出来，像在教研室随口说话一样。简短一两句。）"
+            f"（你想主动说点什么。想法: {short_intent}。"
+            f"自然简短地说，一两句。）"
         )
 
-        # Build messages with brain context
-        messages = self._build_messages(prompt)
+        # Build messages — prompt is appended as extra user message
+        messages = self._build_messages(extra_user_msg=prompt)
 
         async with self._speech_lock:
             full = await self._stream_and_speak(messages, label="auto")

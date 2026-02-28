@@ -41,6 +41,23 @@ _OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
 # Log directory
 _LOG_DIR = Path("logs/brain")
 
+# Image token budget for Qwen2.5-VL (640x480 JPEG ≈ 1000-1500 visual tokens)
+_IMAGE_TOKEN_RESERVE = 1500
+_OUTPUT_TOKEN_RESERVE = 300
+
+
+def _estimate_tokens(text: str) -> int:
+    """Token count estimate for Qwen2.5 models (~1.3x safety margin).
+
+    Qwen2.5 tokenizer: CJK ≈ 0.73 tok/char, ASCII ≈ 0.25 tok/char.
+    We use 1.0/0.3 for ~1.3x overestimate to avoid overflow.
+    """
+    if not text:
+        return 0
+    n_cjk = sum(1 for c in text if ord(c) > 0x2E7F)
+    n_other = len(text) - n_cjk
+    return int(n_cjk * 1.0 + n_other * 0.3) + 4
+
 
 @dataclass
 class ContextBrief:
@@ -50,6 +67,7 @@ class ContextBrief:
     mood_hint: str = ""            # assessment of the user's current state
     speak_directive: str = "LISTEN"  # LISTEN / RESPOND / INITIATE:intent
     suggested_topics: str = ""     # what to talk about
+    conversation_guide: str = ""   # actionable guidance for the 7b based on conversation context
     memory_note: str = ""          # anything worth remembering from recent chat
     updated_at: float = 0.0
 
@@ -87,6 +105,7 @@ class BrainEngine:
         self._last_user_speech_time: float = 0.0
         self._last_bot_speech_time: float = 0.0
         self._last_autonomous_time: float = 0.0
+        self._last_memory_extract_time: float = 0.0
         self._prev_scene: str = ""
 
         # Conversation boundary tracking
@@ -159,24 +178,33 @@ class BrainEngine:
         print(f"[Brain] Logs → {_LOG_DIR.resolve()}/")
 
         while True:
+            # Skip thinking while bot is speaking — saves GPU cycles
+            # and prevents stale RESPOND directives during playback
+            if self._get_bot_speaking():
+                await asyncio.sleep(1.0)
+                continue
+
             # Dynamic interval based on conversation activity
             now = time.monotonic()
             last_speech = max(
                 self._last_user_speech_time,
                 self._last_bot_speech_time,
-                0.1,
             )
-            silence = now - last_speech
 
-            if silence < self._conversation_timeout:
-                # Active conversation — run continuously, minimal yield
-                await asyncio.sleep(0.5)
-            elif silence < 120:
-                # Recent conversation ended — normal interval
+            if last_speech == 0.0:
+                # No speech yet — wait at normal interval
                 await asyncio.sleep(self._interval)
             else:
-                # Long idle — slow down to conserve resources
-                await asyncio.sleep(60.0)
+                silence = now - last_speech
+                if silence < self._conversation_timeout:
+                    # Active conversation — run continuously
+                    await asyncio.sleep(0.5)
+                elif silence < 120:
+                    # Recent conversation ended — normal interval
+                    await asyncio.sleep(self._interval)
+                else:
+                    # Long idle — slow down
+                    await asyncio.sleep(60.0)
 
             try:
                 await self._think()
@@ -205,10 +233,11 @@ class BrainEngine:
         )
         autonomous_gap = time.monotonic() - self._last_autonomous_time
 
-        # Build the brain prompt
+        # Build the brain prompt (image-aware token budgeting)
         prompt = self._build_brain_prompt(
             recent_transcript, memory_text,
             silence_duration, autonomous_gap,
+            has_image=(frame_b64 is not None),
         )
 
         # Save input image to log
@@ -225,10 +254,15 @@ class BrainEngine:
         brief = self._parse_brain_output(raw)
         elapsed = time.perf_counter() - t0
 
-        # Console summary (one line)
+        # Console summary
+        prompt_tokens = _estimate_tokens(prompt) + (_IMAGE_TOKEN_RESERVE if frame_b64 else 0)
+        guide_preview = brief.conversation_guide[:60] if brief.conversation_guide else ""
         print(f"[Brain] #{self._think_count} {_C}{elapsed:.1f}s{_R} "
+              f"| ~{prompt_tokens}tok "
               f"| {brief.speak_directive} "
               f"| {brief.scene[:50]}")
+        if guide_preview:
+            print(f"  guide: {guide_preview}")
 
         # Save full log to file
         log_data = {
@@ -246,7 +280,7 @@ class BrainEngine:
                     "scene": brief.scene,
                     "mood_hint": brief.mood_hint,
                     "speak_directive": brief.speak_directive,
-                    "suggested_topics": brief.suggested_topics,
+                    "conversation_guide": brief.conversation_guide,
                     "memory_note": brief.memory_note,
                 },
             },
@@ -254,11 +288,13 @@ class BrainEngine:
         log_path = _LOG_DIR / f"{log_prefix}_think.json"
         log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2))
 
-        # Handle memory notes
+        # Handle memory notes (cooldown: at most once per 60s)
         if brief.memory_note and brief.memory_note != "无" and self._memory:
-            await self._maybe_extract_memories()
+            if time.monotonic() - self._last_memory_extract_time > 60:
+                self._last_memory_extract_time = time.monotonic()
+                await self._maybe_extract_memories()
 
-        # Handle autonomous speech
+        # Handle autonomous speech (INITIATE directive)
         if brief.speak_directive.startswith("INITIATE:"):
             intent = brief.speak_directive[len("INITIATE:"):].strip()
             if intent and not self._get_bot_speaking():
@@ -269,6 +305,8 @@ class BrainEngine:
                 if cooldown_ok:
                     self._last_autonomous_time = time.monotonic()
                     asyncio.create_task(self._on_autonomous_speech(intent))
+
+        self._prev_scene = brief.scene
 
         async with self._lock:
             self._brief = brief
@@ -328,35 +366,68 @@ class BrainEngine:
         memories: str,
         silence: float,
         autonomous_gap: float,
+        has_image: bool = False,
     ) -> str:
-        mem_section = memories if memories else "（暂无记忆）"
-        transcript_section = transcript if transcript else "（最近没有对话）"
+        """Build brain prompt, dynamically trimming inputs to fit BRAIN_NUM_CTX.
 
-        return (
-            "/no_think\n"
-            "你是小悠的内心思维。你通过摄像头和对话记录感知世界，但你不直接说话。\n"
-            "你的任务是观察、思考、记忆，然后给'说话的自己'提供指导。\n\n"
+        Token budget breakdown:
+          BRAIN_NUM_CTX - image_reserve - output_reserve - template_fixed = variable_budget
+          variable_budget is split: transcript 50%, memories 25%, prev_scene 15%, slack 10%
+        """
+        image_tokens = _IMAGE_TOKEN_RESERVE if has_image else 0
+        text_budget = config.BRAIN_NUM_CTX - image_tokens - _OUTPUT_TOKEN_RESERVE
 
-            f"最近的对话:\n{transcript_section}\n\n"
-            f"你记得的事情:\n{mem_section}\n\n"
-            f"距离上次有人说话: {silence:.0f}秒\n"
-            f"距离你上次主动开口: {autonomous_gap:.0f}秒\n\n"
-
-            "判断规则:\n"
-            "- 如果有人明确在跟你说话，回复 RESPOND\n"
-            "- 如果环境里的说话不是对你说的（背景对话、自言自语、跟别人说话），回复 LISTEN\n"
-            "- 如果你看到明显变化（有人来了、在做新的事情），可以主动打招呼: INITIATE:意图\n"
-            "- 如果很长时间没人说话（超过3分钟）且你有话想说，可以: INITIATE:意图\n"
-            "- 大多数时候保持 LISTEN，不要话太多\n"
-            "- 如果场景没什么变化，保持 LISTEN\n\n"
-
-            "请严格按以下格式输出（每项一行）:\n"
-            "[SCENE] 一句话描述你看到的\n"
-            "[MOOD] 一句话判断对方当前状态\n"
-            "[DIRECTIVE] LISTEN 或 RESPOND 或 INITIATE:意图\n"
-            "[TOPICS] 如果要聊天可以聊什么\n"
-            "[MEMORY_NOTE] 对话中值得记住的事（没有就写'无'）\n"
+        # Estimate template fixed text (placeholders → empty)
+        template_fixed_tokens = _estimate_tokens(
+            config.BRAIN_PROMPT_TEMPLATE.format(
+                prev_scene="", transcript="", memories="",
+                silence=0, autonomous_gap=0,
+            )
         )
+        variable_budget = max(text_budget - template_fixed_tokens, 200)
+
+        # Prepare prev_scene (cap at 15% of variable budget)
+        max_prev_tokens = int(variable_budget * 0.15)
+        prev = self._prev_scene if self._prev_scene else "（第一次观察）"
+        while _estimate_tokens(prev) > max_prev_tokens and len(prev) > 20:
+            prev = prev[:int(len(prev) * 0.7)] + "..."
+
+        # Prepare transcript (50% of variable budget, keep most recent)
+        max_transcript_tokens = int(variable_budget * 0.5)
+        if transcript:
+            while _estimate_tokens(transcript) > max_transcript_tokens and len(transcript) > 50:
+                lines = transcript.split("\n")
+                if len(lines) > 2:
+                    transcript = "...\n" + "\n".join(lines[2:])
+                else:
+                    transcript = "..." + transcript[-int(len(transcript) * 0.6):]
+
+        # Prepare memories (25% of variable budget)
+        max_memory_tokens = int(variable_budget * 0.25)
+        if memories:
+            while _estimate_tokens(memories) > max_memory_tokens and len(memories) > 30:
+                lines = memories.split("\n")
+                if len(lines) > 1:
+                    memories = "\n".join(lines[:-1]) + "\n..."
+                else:
+                    memories = memories[:int(len(memories) * 0.6)] + "..."
+
+        prompt = config.BRAIN_PROMPT_TEMPLATE.format(
+            prev_scene=prev,
+            transcript=transcript if transcript else "（最近没有对话）",
+            memories=memories if memories else "（暂无记忆）",
+            silence=silence,
+            autonomous_gap=autonomous_gap,
+        )
+
+        # Final safety: hard-truncate if still over budget
+        total = _estimate_tokens(prompt)
+        if total > text_budget:
+            # Keep template structure but truncate the assembled text
+            target_chars = int(text_budget / 1.5)
+            prompt = prompt[:target_chars] + "\n...(截断)"
+
+        return prompt
 
     # ── parse brain output ────────────────────────────────────────────────────
 
@@ -371,7 +442,8 @@ class BrainEngine:
             memories=self._brief.memories,  # keep existing until updated
             mood_hint=extract("MOOD"),
             speak_directive=extract("DIRECTIVE") or "LISTEN",
-            suggested_topics=extract("TOPICS"),
+            suggested_topics=extract("TOPICS"),  # kept for backward compat
+            conversation_guide=extract("GUIDE"),
             memory_note=extract("MEMORY_NOTE"),
             updated_at=time.monotonic(),
         )
@@ -400,7 +472,7 @@ class BrainEngine:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _format_recent_transcript(self, max_entries: int = 10) -> str:
+    def _format_recent_transcript(self, max_entries: int = 6) -> str:
         """Merge recent user and bot texts into a chronological transcript."""
         combined: list[tuple[float, str, str]] = []
         for ts, txt in self._recent_user_texts:
