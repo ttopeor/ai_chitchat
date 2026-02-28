@@ -99,6 +99,7 @@ async def _ollama_unload(model: str) -> None:
 
 from brain import BrainEngine
 from memory import MemoryManager
+from screen import ScreenCapture
 from vision import CameraCapture
 
 # ANSI color for timing output
@@ -239,6 +240,14 @@ class VoiceBot:
                 interval=config.CAMERA_INTERVAL,
             )
 
+        # ── Screen Capture (remote Windows screenshot) ───────────────────────
+        self.screen: ScreenCapture | None = None
+        if config.SCREEN_ENABLED:
+            self.screen = ScreenCapture(
+                url=config.SCREEN_URL,
+                interval=config.SCREEN_INTERVAL,
+            )
+
         # ── Memory ────────────────────────────────────────────────────────────
         self.memory: MemoryManager | None = None
         if config.MEMORY_ENABLED:
@@ -256,6 +265,7 @@ class VoiceBot:
             self.brain = BrainEngine(
                 model=config.BRAIN_MODEL,
                 camera=self.camera,
+                screen=self.screen,
                 memory=self.memory,
                 get_history=lambda: self.history,
                 get_bot_speaking=lambda: self.bot_speaking.is_set(),
@@ -785,6 +795,11 @@ class VoiceBot:
             print("Starting camera…")
             self.camera.start()
 
+        # Start screen capture
+        if self.screen:
+            print("Starting screen capture…")
+            await self.screen.start()
+
         # Load memories
         if self.memory:
             removed = self.memory.consolidate()
@@ -827,6 +842,8 @@ class VoiceBot:
         # Release resources
         if self.camera:
             self.camera.stop()
+        if self.screen:
+            await self.screen.stop()
 
         # Unload model from VRAM
         print("Releasing model…")

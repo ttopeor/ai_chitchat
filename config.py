@@ -55,8 +55,10 @@ SYSTEM_PROMPT = (
 BRAIN_PROMPT_TEMPLATE = (
     "/no_think\n"
     "你是小悠的内心思维。\n"
-    "重要：摄像头就是你的眼睛！你眼前看到的人就是正在跟你说话的越哥。\n"
-    "不要说'画面中的人'——那就是你面前的越哥，用'他'来称呼。\n"
+    "你有两个视角：\n"
+    "- 第一张图：摄像头——你面前的越哥（不要说'画面中的人'，用'他'称呼）\n"
+    "- 第二张图（如果有）：他的电脑屏幕——他正在看什么、做什么\n"
+    "两张图结合起来理解他当前的状态。\n"
     "你不直接说话，你的任务是：用眼睛看 → 理解对话 → 给'说话的自己'提供具体指导。\n"
     "你输出的[GUIDE]会直接决定'说话的自己'下一句怎么回复，所以要具体、实用。\n\n"
 
@@ -69,6 +71,7 @@ BRAIN_PROMPT_TEMPLATE = (
     "视觉观察要求:\n"
     "- 看对话内容！如果对方问了视觉问题（穿什么、拿什么、在做什么），从你眼前找到答案\n"
     "- 关注与上次相比的变化（姿势、动作、手上的东西、衣着等）\n"
+    "- 如果能看到他的屏幕，留意他在做什么（写代码、看视频、浏览网页等），但不要每次都念出来，只在有意义时提及\n"
     "- 不要重复没变的背景，聚焦细节和变化\n"
     "- 用'他'称呼对方，不要说'画面中的人'\n\n"
 
@@ -118,6 +121,11 @@ CAMERA_WIDTH     = 640
 CAMERA_HEIGHT    = 480
 CAMERA_INTERVAL  = 3.0     # seconds between frame captures
 
+# ── Screen Capture（远程 Windows 屏幕截图）──────────────────────────────────
+SCREEN_ENABLED   = True
+SCREEN_URL       = "http://10.0.0.70:7890/screenshot"  # Windows screen_server.py
+SCREEN_INTERVAL  = 3.0     # fetch 间隔秒数
+
 # ── Brain (background thinker) ──────────────────────────────────────────────
 BRAIN_ENABLED           = True
 BRAIN_INTERVAL          = 20      # seconds between think cycles
@@ -141,6 +149,7 @@ CONV_INTENT_MAX_CHARS    = 400    # 自主发言意图完整保留
 
 # ── Token 限制 (脑 brain 侧) ───────────────────────────────────────────────
 BRAIN_IMAGE_TOKEN_RESERVE  = 1500   # 不变 — 640x480 JPEG 大小固定
+SCREEN_IMAGE_TOKEN_RESERVE = 1200   # 1280x549 缩放后的屏幕截图
 BRAIN_OUTPUT_TOKEN_RESERVE = 500    # content 输出（thinking 已关闭）
 BRAIN_TRANSCRIPT_ENTRIES   = 40     # 脑看完整对话脉络，不再只看几轮就下判断
 BRAIN_RECENT_MAX_AGE       = 1800   # 脑记住30分钟内的对话

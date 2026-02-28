@@ -29,6 +29,7 @@ import httpx
 
 import config
 from memory import MemoryManager
+from screen import ScreenCapture
 from vision import CameraCapture
 
 # ANSI
@@ -77,6 +78,7 @@ class BrainEngine:
         self,
         model: str,
         camera: CameraCapture | None,
+        screen: ScreenCapture | None,
         memory: MemoryManager | None,
         get_history: callable,
         get_bot_speaking: callable,
@@ -87,6 +89,7 @@ class BrainEngine:
     ):
         self._model = model
         self._camera = camera
+        self._screen = screen
         self._memory = memory
         self._get_history = get_history
         self._get_bot_speaking = get_bot_speaking
@@ -197,7 +200,7 @@ class BrainEngine:
         prompt = config.PROFILE_SYNTHESIS_PROMPT.format(memories=mem_text)
 
         try:
-            result, _ = await self._call_ollama(prompt, image_b64=None)
+            result, _ = await self._call_ollama(prompt)
             if result and len(result.strip()) > 5:
                 self._dynamic_background = result.strip()
                 print(f"[Brain] Dynamic background synthesized ({len(self._dynamic_background)} chars)")
@@ -266,6 +269,12 @@ class BrainEngine:
 
         # Gather inputs
         frame_b64 = self._camera.get_latest_frame_b64() if self._camera else None
+        screen_b64 = self._screen.get_latest_frame_b64() if self._screen else None
+        images: list[str] = []
+        if frame_b64:
+            images.append(frame_b64)
+        if screen_b64:
+            images.append(screen_b64)
         recent_transcript = self._format_recent_transcript()
         memory_text = ""
         if self._memory:
@@ -282,16 +291,19 @@ class BrainEngine:
         prompt = self._build_brain_prompt(
             recent_transcript, memory_text,
             silence_duration, autonomous_gap,
-            has_image=(frame_b64 is not None),
+            num_images=len(images),
         )
 
-        # Save input image to log
+        # Save input images to log
         if frame_b64:
             img_path = _LOG_DIR / f"{log_prefix}_input.jpg"
             img_path.write_bytes(base64.b64decode(frame_b64))
+        if screen_b64:
+            img_path = _LOG_DIR / f"{log_prefix}_screen.jpg"
+            img_path.write_bytes(base64.b64decode(screen_b64))
 
-        # Call model via native Ollama API (thinking enabled for deeper reasoning)
-        raw, thinking = await self._call_ollama(prompt, frame_b64)
+        # Call model via native Ollama API
+        raw, thinking = await self._call_ollama(prompt, images or None)
         if raw is None:
             return
 
@@ -300,7 +312,12 @@ class BrainEngine:
         elapsed = time.perf_counter() - t0
 
         # Console summary
-        prompt_tokens = _estimate_tokens(prompt) + (_IMAGE_TOKEN_RESERVE if frame_b64 else 0)
+        image_tok = 0
+        if frame_b64:
+            image_tok += _IMAGE_TOKEN_RESERVE
+        if screen_b64:
+            image_tok += config.SCREEN_IMAGE_TOKEN_RESERVE
+        prompt_tokens = _estimate_tokens(prompt) + image_tok
         guide_preview = brief.conversation_guide[:80] if brief.conversation_guide else ""
         print(f"[Brain] #{self._think_count} {_C}{elapsed:.1f}s{_R} "
               f"| ~{prompt_tokens}tok "
@@ -321,11 +338,13 @@ class BrainEngine:
                 "options": {"num_ctx": config.MODEL_NUM_CTX},
                 "think": False,
                 "prompt": prompt,
-                "has_image": frame_b64 is not None,
+                "has_image": bool(frame_b64),
+                "has_screen": bool(screen_b64),
                 "image_file": f"{log_prefix}_input.jpg" if frame_b64 else None,
+                "screen_file": f"{log_prefix}_screen.jpg" if screen_b64 else None,
                 "token_estimates": {
                     "prompt": _estimate_tokens(prompt),
-                    "image_reserve": _IMAGE_TOKEN_RESERVE if frame_b64 else 0,
+                    "image_reserve": image_tok,
                     "output_reserve": _OUTPUT_TOKEN_RESERVE,
                     "total_input": prompt_tokens,
                     "budget": config.MODEL_NUM_CTX,
@@ -374,27 +393,17 @@ class BrainEngine:
     # ── Ollama native API call ───────────────────────────────────────────────
 
     async def _call_ollama(
-        self, prompt: str, image_b64: str | None
+        self, prompt: str, images: list[str] | None = None
     ) -> tuple[str | None, str]:
-        """Call the brain model via Ollama native /api/chat with thinking enabled.
+        """Call the brain model via Ollama native /api/chat.
 
         Returns (content, thinking) tuple. thinking contains the model's
         chain-of-thought reasoning (empty string if none).
         """
-        messages = []
-
-        # Build message with optional image
-        if image_b64:
-            messages.append({
-                "role": "user",
-                "content": prompt,
-                "images": [image_b64],
-            })
-        else:
-            messages.append({
-                "role": "user",
-                "content": prompt,
-            })
+        msg: dict = {"role": "user", "content": prompt}
+        if images:
+            msg["images"] = images
+        messages = [msg]
 
         body = {
             "model": self._model,
@@ -429,7 +438,7 @@ class BrainEngine:
         memories: str,
         silence: float,
         autonomous_gap: float,
-        has_image: bool = False,
+        num_images: int = 0,
     ) -> str:
         """Build brain prompt, dynamically trimming inputs to fit BRAIN_NUM_CTX.
 
@@ -437,7 +446,11 @@ class BrainEngine:
           BRAIN_NUM_CTX - image_reserve - output_reserve - template_fixed = variable_budget
           variable_budget is split: transcript 50%, memories 25%, prev_scene 15%, slack 10%
         """
-        image_tokens = _IMAGE_TOKEN_RESERVE if has_image else 0
+        image_tokens = 0
+        if num_images >= 1:
+            image_tokens += _IMAGE_TOKEN_RESERVE                # camera
+        if num_images >= 2:
+            image_tokens += config.SCREEN_IMAGE_TOKEN_RESERVE   # screen
         text_budget = config.MODEL_NUM_CTX - image_tokens - _OUTPUT_TOKEN_RESERVE
 
         # Estimate template fixed text (placeholders → empty)
