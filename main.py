@@ -692,6 +692,9 @@ class VoiceBot:
 
             # Relevance check: is this speech directed at 小悠?
             if self.brain and not self.brain.should_respond(text):
+                # Media playing → save transcription as media audio for later memory extraction
+                if self.brain.is_media_playing():
+                    self.brain.record_media_audio(text)
                 print("  (not directed at bot, ignoring)")
                 continue
 

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ from pathlib import Path
 import httpx
 
 import config
-from memory import MemoryManager
+from memory import MemoryEntry, MemoryManager
 from screen import ScreenCapture
 from vision import CameraCapture
 
@@ -70,6 +71,7 @@ class ContextBrief:
     suggested_topics: str = ""     # what to talk about
     conversation_guide: str = ""   # actionable guidance for the 7b based on conversation context
     memory_note: str = ""          # anything worth remembering from recent chat
+    media_playing: bool = False    # is media (video/music) playing on screen?
     updated_at: float = 0.0
 
 
@@ -117,6 +119,10 @@ class BrainEngine:
         # Dynamic background (synthesized from memory at startup, refreshed on new memories)
         self._dynamic_background: str = ""
 
+        # Media audio buffer (STT transcriptions captured during media playback)
+        self._media_audio_buffer: list[str] = []
+        self._last_media_memory_time: float = 0.0
+
         # Think cycle counter (for log filenames)
         self._think_count = 0
 
@@ -143,26 +149,39 @@ class BrainEngine:
 
     def should_respond(self, text: str) -> bool:
         """Quick heuristic: is this speech directed at 小悠?"""
-        # Name mentioned → always respond (handle STT variants: 小悠/小優/小尤/xiǎo yōu)
+        # 1. Name mentioned → always respond
         name_variants = ("小悠", "小優", "小尤", "小游", "小由", "小油")
         if any(n in text for n in name_variants):
             return True
 
-        # Active conversation (recent exchange within timeout)
+        # 2. Brain hasn't had its first think yet — be generous, respond
+        if self._brief.updated_at == 0.0:
+            return True
+
+        # 3. Media playing → only respond if brain says RESPOND
+        #    (skip conversation timeout to filter out media audio)
+        if self._brief.media_playing:
+            return self._brief.speak_directive == "RESPOND"
+
+        # 4. Active conversation (recent exchange within timeout)
         now = time.monotonic()
         if now - self._last_bot_speech_time < self._conversation_timeout:
             return True
 
-        # Brain hasn't had its first think yet — be generous, respond
-        if self._brief.updated_at == 0.0:
-            return True
-
-        # Current directive from brain
-        directive = self._brief.speak_directive
-        if directive == "RESPOND":
+        # 5. Current directive from brain
+        if self._brief.speak_directive == "RESPOND":
             return True
 
         return False
+
+    def is_media_playing(self) -> bool:
+        """Check if the brain detects media playing on screen."""
+        return self._brief.media_playing
+
+    def record_media_audio(self, text: str) -> None:
+        """Buffer transcribed media audio for later memory extraction."""
+        self._media_audio_buffer.append(text)
+        print(f"  (media audio buffered, {len(self._media_audio_buffer)} segments)")
 
     async def think_once(self) -> None:
         """Run a single think cycle (called during startup)."""
@@ -361,6 +380,7 @@ class BrainEngine:
                     "speak_directive": brief.speak_directive,
                     "conversation_guide": brief.conversation_guide,
                     "memory_note": brief.memory_note,
+                    "media_playing": brief.media_playing,
                 },
             },
         }
@@ -372,6 +392,15 @@ class BrainEngine:
             if time.monotonic() - self._last_memory_extract_time > 60:
                 self._last_memory_extract_time = time.monotonic()
                 await self._maybe_extract_memories()
+
+        # Extract media memories when media stops or buffer is full
+        if self._media_audio_buffer and self._memory:
+            buffer_full = len(self._media_audio_buffer) >= 20
+            media_stopped = not brief.media_playing
+            cooldown_ok = time.monotonic() - self._last_media_memory_time > 60
+            if (media_stopped or buffer_full) and cooldown_ok:
+                self._last_media_memory_time = time.monotonic()
+                await self._extract_media_memories()
 
         # Handle autonomous speech (INITIATE directive)
         if brief.speak_directive.startswith("INITIATE:"):
@@ -513,6 +542,9 @@ class BrainEngine:
             m = re.search(pattern, raw)
             return m.group(1).strip() if m else ""
 
+        media_str = extract("MEDIA")
+        media_playing = media_str.upper().startswith("Y") if media_str else False
+
         return ContextBrief(
             scene=extract("SCENE") or self._prev_scene,
             memories=self._brief.memories,  # keep existing until updated
@@ -521,6 +553,7 @@ class BrainEngine:
             suggested_topics=extract("TOPICS"),  # kept for backward compat
             conversation_guide=extract("GUIDE"),
             memory_note=extract("MEMORY_NOTE"),
+            media_playing=media_playing,
             updated_at=time.monotonic(),
         )
 
@@ -548,6 +581,72 @@ class BrainEngine:
 
             # Refresh dynamic background with new memories
             await self.synthesize_dynamic_background()
+
+    # ── media memory extraction ────────────────────────────────────────────
+
+    async def _extract_media_memories(self) -> None:
+        """Extract memories from buffered media audio transcriptions."""
+        if not self._media_audio_buffer or not self._memory:
+            return
+
+        audio_text = "\n".join(self._media_audio_buffer)
+        self._media_audio_buffer.clear()
+
+        # Truncate if too long (keep last ~4000 chars)
+        if len(audio_text) > 4000:
+            audio_text = "...\n" + audio_text[-4000:]
+
+        prompt = (
+            "/no_think\n"
+            "以下是对方正在观看的视频/媒体的音频转录内容:\n\n"
+            f"{audio_text}\n\n"
+            "请总结这个视频/媒体的主题和关键内容，用一两句话概括他在看什么。\n"
+            "用JSON数组格式回复，每条记忆包含:\n"
+            '{"category": "media", "content": "他在看一个关于...的视频/节目", '
+            '"keywords": ["关键词1", "关键词2"], "importance": 2}\n\n'
+            "如果内容太碎片化无法总结，回复空数组 []\n"
+            "只回复JSON，不要其他文字。"
+        )
+
+        try:
+            result = await self._memory._call_ollama(prompt)
+            if result is None:
+                return
+
+            if result.startswith("```"):
+                result = result.split("\n", 1)[1].rsplit("```", 1)[0]
+
+            entries_data = json.loads(result)
+            if not isinstance(entries_data, list) or not entries_data:
+                return
+
+            now_str = datetime.now().isoformat()
+            source = f"观看视频于{datetime.now().strftime('%m月%d日%H:%M')}"
+
+            new_entries: list[MemoryEntry] = []
+            for d in entries_data:
+                if not isinstance(d, dict) or "content" not in d:
+                    continue
+                new_entries.append(MemoryEntry(
+                    id=uuid.uuid4().hex[:8],
+                    timestamp=now_str,
+                    category="media",
+                    content=d["content"],
+                    keywords=d.get("keywords", []),
+                    importance=min(3, max(1, int(d.get("importance", 2)))),
+                    source=source,
+                ))
+
+            new_entries = self._memory._deduplicate(new_entries)
+            if new_entries:
+                self._memory._append(new_entries)
+                self._memory._memories.extend(new_entries)
+                print(f"[Brain] Extracted {len(new_entries)} media memories:")
+                for m in new_entries:
+                    print(f"  [media] {m.content}")
+
+        except Exception as e:
+            print(f"[Brain] media memory extraction error: {e}")
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

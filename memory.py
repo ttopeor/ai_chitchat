@@ -26,7 +26,7 @@ _OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
 class MemoryEntry:
     id: str
     timestamp: str
-    category: str          # fact / preference / event / emotion / routine
+    category: str          # fact / preference / event / emotion / routine / media
     content: str
     keywords: list[str]
     importance: int        # 1-5
