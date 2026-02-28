@@ -2,6 +2,9 @@
 CosyVoice/
 pretrained_models/
 
+logs
+memories
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -11,5 +11,8 @@ openai
 # TTS
 chattts-fork
 
+# Vision
+opencv-python-headless
+
 # Note: torch/torchvision/torchaudio are installed by setup.sh from the
 # CUDA 12.4 index to ensure version coherence. Do not add them here.
