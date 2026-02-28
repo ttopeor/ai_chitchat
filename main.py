@@ -1,8 +1,9 @@
 """
 VoiceBot — dual-system voice chat with vision, memory, and autonomous speech.
 
-  System 1 (32b): real-time conversation — mouth & reflexes
-  System 2 (72b): background thinker — vision, memory, context generation
+  Single model (qwen3.5:122b) with parallel slots:
+    System 1 (conv): real-time conversation — mouth & reflexes
+    System 2 (brain): background thinker — vision, memory, context generation
 
   STT : faster-whisper  (CUDA)
   TTS : ChatTTS          (CUDA)
@@ -75,6 +76,27 @@ async def _ollama_load(
                     pass  # drain stream — model loads as we read
     except Exception as e:
         print(f"  [Ollama] load({model}) failed: {e}")
+
+
+async def _ollama_unload(model: str) -> None:
+    """Unload a model from Ollama VRAM immediately.
+
+    Uses /api/generate with keep_alive=0 and no prompt — the official way
+    to evict a model without re-loading it with default context.
+    """
+    body = {"model": model, "keep_alive": 0}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{_OLLAMA_BASE}/api/generate",
+                json=body,
+                timeout=httpx.Timeout(connect=10, read=30, write=10, pool=10),
+            )
+            resp.raise_for_status()
+    except Exception as e:
+        print(f"  [Ollama] unload({model}) failed: {e}")
+
+
 from brain import BrainEngine
 from memory import MemoryManager
 from vision import CameraCapture
@@ -86,21 +108,8 @@ _R = "\033[0m"    # reset
 
 # ── conversation logger ─────────────────────────────────────────────────────
 
-_CONV_LOG_DIR = Path("logs/conversation")
-_CONV_LOG_DIR.mkdir(parents=True, exist_ok=True)
-_conv_log_path = _CONV_LOG_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-
-
-def _log_conv(role: str, text: str, **extra):
-    """Append a conversation event to the session log file."""
-    entry = {
-        "time": datetime.now().isoformat(),
-        "role": role,
-        "text": text,
-        **extra,
-    }
-    with open(_conv_log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+_CONV_DETAIL_DIR = Path("logs/conv")
+_CONV_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── token estimation ─────────────────────────────────────────────────────────
@@ -216,6 +225,9 @@ class VoiceBot:
 
         # Concurrency: only one speech generation at a time
         self._speech_lock = asyncio.Lock()
+
+        # Conv API call counter for log filenames
+        self._conv_call_count = 0
 
         # ── Vision ────────────────────────────────────────────────────────────
         self.camera: CameraCapture | None = None
@@ -349,7 +361,7 @@ class VoiceBot:
         loop = asyncio.get_running_loop()
 
         def _run() -> str:
-            segs, _ = self.asr.transcribe(audio, beam_size=5, vad_filter=True)
+            segs, _ = self.asr.transcribe(audio, beam_size=5, vad_filter=True, language="zh")
             return "".join(s.text for s in segs).strip()
 
         return await loop.run_in_executor(None, _run)
@@ -445,8 +457,8 @@ class VoiceBot:
           [system] brain context (scene + guide) ← injected LATE
           [user] latest message (from history or extra_user_msg)
         """
-        budget = config.CONV_NUM_CTX
-        output_reserve = 200  # tokens reserved for model's reply
+        budget = config.MODEL_NUM_CTX
+        output_reserve = config.CONV_OUTPUT_RESERVE
 
         # Fixed: system prompt
         sys_tokens = _estimate_tokens(config.SYSTEM_PROMPT)
@@ -458,12 +470,9 @@ class VoiceBot:
             brief = self.brain.get_context_brief()
             parts: list[str] = []
             if brief.scene:
-                parts.append(f"你看到: {brief.scene[:120]}")
-            if brief.memories:
-                mem = brief.memories[:200] if len(brief.memories) > 200 else brief.memories
-                parts.append(f"你记得的事: {mem}")
+                parts.append(f"你看到: {brief.scene[:config.CONV_SCENE_MAX_CHARS]}")
             if brief.conversation_guide:
-                parts.append(f"你的想法: {brief.conversation_guide[:150]}")
+                parts.append(f"你的想法: {brief.conversation_guide[:config.CONV_GUIDE_MAX_CHARS]}")
             if parts:
                 brain_context = (
                     "【感知】\n"
@@ -543,10 +552,11 @@ class VoiceBot:
                 "model": config.CONV_MODEL,
                 "messages": messages,
                 "options": {
-                    "num_ctx": config.CONV_NUM_CTX,
-                    "num_predict": 100,   # ~2 Chinese sentences; hard cap to enforce brevity
+                    "num_ctx": config.MODEL_NUM_CTX,
+                    "num_predict": config.CONV_NUM_PREDICT,
                 },
                 "stream": True,
+                "think": False,   # disable thinking at API level (prompt /no_think alone isn't enough)
             }
             async with httpx.AsyncClient() as client:
                 async with client.stream(
@@ -606,6 +616,43 @@ class VoiceBot:
             print(f"  | TTFT {_C}{ttft:.2f}s{_R} | TTS+play {_C}{tts_elapsed:.2f}s{_R}")
             self.interrupt.clear()
 
+        # Save detailed conv log (full input/output for token analysis)
+        self._conv_call_count += 1
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "cycle": self._conv_call_count,
+            "label": label,
+            "timing": {
+                "ttft_s": round(ttft, 2),
+                "tts_play_s": round(tts_elapsed, 2),
+            },
+            "input": {
+                "model": config.CONV_MODEL,
+                "options": {
+                    "num_ctx": config.MODEL_NUM_CTX,
+                    "num_predict": config.CONV_NUM_PREDICT,
+                },
+                "think": False,
+                "messages": messages,
+                "token_estimates": {
+                    "per_message": [
+                        {"role": m["role"], "tokens": _estimate_tokens(m["content"]), "chars": len(m["content"])}
+                        for m in messages
+                    ],
+                    "total_input": sum(_estimate_tokens(m["content"]) for m in messages),
+                    "output_reserve": config.CONV_OUTPUT_RESERVE,
+                    "budget": config.MODEL_NUM_CTX,
+                },
+            },
+            "output": {
+                "text": full,
+                "tokens_est": _estimate_tokens(full),
+            },
+        }
+        log_path = _CONV_DETAIL_DIR / f"{ts}_{self._conv_call_count:04d}_{label}.json"
+        log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2))
+
         return full
 
     # ── main pipeline ─────────────────────────────────────────────────────────
@@ -626,7 +673,6 @@ class VoiceBot:
                 continue
             stt_elapsed = time.perf_counter() - t_stt
             print(f"[user] {text}  | STT {_C}{stt_elapsed:.2f}s{_R}")
-            _log_conv("user", text, stt_s=round(stt_elapsed, 2))
 
             # Notify brain of user speech
             if self.brain:
@@ -635,7 +681,6 @@ class VoiceBot:
             # Relevance check: is this speech directed at 小悠?
             if self.brain and not self.brain.should_respond(text):
                 print("  (not directed at bot, ignoring)")
-                _log_conv("system", "ignored (not directed at bot)")
                 continue
 
             # Append to conversation history
@@ -649,7 +694,6 @@ class VoiceBot:
 
             if full:
                 self.history.append({"role": "assistant", "content": full})
-                _log_conv("bot", full)
                 if self.brain:
                     self.brain.record_bot_speech(full)
 
@@ -663,10 +707,9 @@ class VoiceBot:
         if self.bot_speaking.is_set():
             return
 
-        _log_conv("system", f"autonomous speech triggered: {intent}")
-
         # Truncate long intents to save tokens
-        short_intent = intent[:100] if len(intent) > 100 else intent
+        mc = config.CONV_INTENT_MAX_CHARS
+        short_intent = intent[:mc] if len(intent) > mc else intent
         prompt = (
             f"（你想主动说点什么。想法: {short_intent}。"
             f"自然简短地说，一两句。）"
@@ -681,13 +724,12 @@ class VoiceBot:
         if full:
             # Record in history as a natural utterance (not the meta-prompt)
             self.history.append({"role": "assistant", "content": full})
-            _log_conv("auto", full)
             if self.brain:
                 self.brain.record_bot_speech(full)
 
     # ── history management ────────────────────────────────────────────────────
 
-    def _trim_history(self, max_messages: int = 20) -> None:
+    def _trim_history(self, max_messages: int = config.CONV_MAX_HISTORY) -> None:
         """Keep system prompt + last N messages."""
         if len(self.history) <= max_messages + 1:
             return
@@ -729,19 +771,12 @@ class VoiceBot:
         )
         print(f"  ChatTTS ready  | {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
-        # Pin models in VRAM (keep_alive=-1, limited context to save VRAM)
+        # Pin model in VRAM (keep_alive=-1, single model with parallel slots)
         t0 = time.perf_counter()
-        print(f"Loading conversation model ({config.CONV_MODEL}, "
-              f"ctx={config.CONV_NUM_CTX})…")
-        await _ollama_load(config.CONV_MODEL, -1, config.CONV_NUM_CTX)
-        print(f"  Conv model pinned | {_C}{time.perf_counter() - t0:.2f}s{_R}")
-
-        if config.BRAIN_ENABLED:
-            t0 = time.perf_counter()
-            print(f"Loading brain model ({config.BRAIN_MODEL}, "
-                  f"ctx={config.BRAIN_NUM_CTX})…")
-            await _ollama_load(config.BRAIN_MODEL, -1, config.BRAIN_NUM_CTX)
-            print(f"  Brain model pinned | {_C}{time.perf_counter() - t0:.2f}s{_R}")
+        print(f"Loading model ({config.CONV_MODEL}, "
+              f"ctx={config.MODEL_NUM_CTX})…")
+        await _ollama_load(config.CONV_MODEL, -1, config.MODEL_NUM_CTX)
+        print(f"  Model pinned | {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
         # Start camera
         if self.camera:
@@ -763,7 +798,7 @@ class VoiceBot:
 
         print("\nAll systems ready.\n")
 
-        print(f"Conversation log: {_conv_log_path}")
+        print(f"Conv detail logs: {_CONV_DETAIL_DIR.resolve()}/")
 
         # Gather all async loops with graceful Ctrl+C shutdown
         stop = asyncio.Event()
@@ -787,12 +822,10 @@ class VoiceBot:
         if self.camera:
             self.camera.stop()
 
-        # Unpin models — restore default keep_alive so Ollama can reclaim VRAM
-        print("Releasing models…")
-        await _ollama_load(config.CONV_MODEL, "5m")
-        if config.BRAIN_ENABLED:
-            await _ollama_load(config.BRAIN_MODEL, "5m")
-        print("Models released. Bye!")
+        # Unload model from VRAM
+        print("Releasing model…")
+        await _ollama_unload(config.CONV_MODEL)
+        print("Model released. Bye!")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────────

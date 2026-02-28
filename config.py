@@ -2,13 +2,12 @@
 LLM_BASE_URL = "http://10.0.0.190:11434/v1"
 LLM_API_KEY  = "ollama"
 
-# 双系统: 32b 负责实时对话, 72b 负责后台思考 (深)
-# Ollama 服务端需设置: OLLAMA_MAX_MODELS=2 (允许同时加载两个模型)
-# main.py 启动时自动 pin 两个模型 (keep_alive=-1)，退出时自动释放
-CONV_MODEL    = "qwen2.5vl:32b"    # 实时对话 — 比7b更聪明，能更好地遵循指令
-CONV_NUM_CTX  = 2048               # 对话 context 窗口 (32b+72b显存紧张，保持小)
-BRAIN_MODEL   = "qwen2.5vl:72b"   # 后台大脑 — 视觉理解、记忆、决策
-BRAIN_NUM_CTX = 8192               # 大脑 context 窗口 (从16384降到8192省显存)
+# 单模型双通道: qwen3.5:122b 同时用于实时对话(嘴)和后台思考(脑)
+# Ollama 服务端需设置: OLLAMA_NUM_PARALLEL=2 (允许同一模型两路并发)
+# main.py 启动时 pin 一次模型 (keep_alive=-1)，退出时释放
+CONV_MODEL    = "qwen3.5:122b"     # 实时对话 (嘴)
+BRAIN_MODEL   = "qwen3.5:122b"    # 后台大脑 (脑) — 同一模型
+MODEL_NUM_CTX = 128000              # 统一 context 窗口 (每个 parallel slot 独立分配)
 # /no_think skips Qwen3 chain-of-thought, keeps responses snappy
 # ── 嘴的 prompt（32b 实时对话用）────────────────────────────────────────────
 SYSTEM_PROMPT = (
@@ -82,11 +81,11 @@ BRAIN_PROMPT_TEMPLATE = (
     "- 长时间没人说话（>3分钟）且有话想说 → INITIATE:意图\n"
     "- 大多数时候保持 LISTEN\n\n"
 
-    "请严格按以下格式输出（每项一行，必须简短！）:\n"
-    "[SCENE] 一句话描述变化和对话相关的视觉细节，用'他'称呼\n"
-    "[MOOD] 一句话判断状态\n"
+    "请按以下格式输出:\n"
+    "[SCENE] 描述你看到的变化和细节，用'他'称呼\n"
+    "[MOOD] 判断他的情绪状态和微妙变化\n"
     "[DIRECTIVE] LISTEN 或 RESPOND 或 INITIATE:意图\n"
-    "[GUIDE] 最重要！一句话告诉自己该怎么接话。不要写建议列表，不要纠结旧话题。限30字以内。\n"
+    "[GUIDE] 最重要！具体告诉自己怎么接话——语气、态度、可以提到什么细节、应该避免什么。要像给自己写小纸条一样具体实用，不要泛泛而谈。\n"
     "[MEMORY_NOTE] 值得记住的事（没有就写'无'）\n"
 )
 
@@ -121,7 +120,7 @@ CAMERA_WIDTH     = 640
 CAMERA_HEIGHT    = 480
 CAMERA_INTERVAL  = 3.0     # seconds between frame captures
 
-# ── Brain (72b background thinker) ───────────────────────────────────────────
+# ── Brain (background thinker) ──────────────────────────────────────────────
 BRAIN_ENABLED           = True
 BRAIN_INTERVAL          = 20      # seconds between think cycles
 AUTONOMOUS_COOLDOWN     = 120     # min seconds between autonomous speeches
@@ -133,3 +132,18 @@ MEMORY_DIR               = "memories"
 MEMORY_FILE              = "memories.jsonl"
 MEMORY_MAX_CONTEXT       = 8      # max memories injected into prompt
 MEMORY_EXTRACT_MIN_TURNS = 2      # min user turns before extracting
+
+# ── Token 限制 (嘴 conv 侧) ────────────────────────────────────────────────
+CONV_NUM_PREDICT         = 200    # 唯一硬约束：TTS 延迟。prompt 要求"最多两句话"，200 tok 已是 3-4 句的空间
+CONV_OUTPUT_RESERVE      = 200    # 和 num_predict 保持一致
+CONV_MAX_HISTORY         = 200    # 100轮对话记忆 (~10K tok)，128K下毫无压力
+CONV_SCENE_MAX_CHARS     = 800    # 脑的视觉描述几乎不截断（脑输出本身就短）
+CONV_GUIDE_MAX_CHARS     = 800    # 脑的指导几乎不截断，完整传达脑的意图
+CONV_INTENT_MAX_CHARS    = 400    # 自主发言意图完整保留
+
+# ── Token 限制 (脑 brain 侧) ───────────────────────────────────────────────
+BRAIN_IMAGE_TOKEN_RESERVE  = 1500   # 不变 — 640x480 JPEG 大小固定
+BRAIN_OUTPUT_TOKEN_RESERVE = 500    # content 输出（thinking 已关闭）
+BRAIN_TRANSCRIPT_ENTRIES   = 40     # 脑看完整对话脉络，不再只看几轮就下判断
+BRAIN_RECENT_MAX_AGE       = 1800   # 脑记住30分钟内的对话
+BRAIN_RECENT_MAX_COUNT     = 100    # 配合 max_age，缓存足够多的对话

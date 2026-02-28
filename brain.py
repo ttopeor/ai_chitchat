@@ -41,9 +41,9 @@ _OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
 # Log directory
 _LOG_DIR = Path("logs/brain")
 
-# Image token budget for Qwen2.5-VL (640x480 JPEG ≈ 1000-1500 visual tokens)
-_IMAGE_TOKEN_RESERVE = 1500
-_OUTPUT_TOKEN_RESERVE = 300
+# Token reserves (read from config)
+_IMAGE_TOKEN_RESERVE = config.BRAIN_IMAGE_TOKEN_RESERVE
+_OUTPUT_TOKEN_RESERVE = config.BRAIN_OUTPUT_TOKEN_RESERVE
 
 
 def _estimate_tokens(text: str) -> int:
@@ -245,8 +245,8 @@ class BrainEngine:
             img_path = _LOG_DIR / f"{log_prefix}_input.jpg"
             img_path.write_bytes(base64.b64decode(frame_b64))
 
-        # Call 72b via native Ollama API (ensures num_ctx is respected)
-        raw = await self._call_ollama(prompt, frame_b64)
+        # Call model via native Ollama API (thinking enabled for deeper reasoning)
+        raw, thinking = await self._call_ollama(prompt, frame_b64)
         if raw is None:
             return
 
@@ -256,13 +256,15 @@ class BrainEngine:
 
         # Console summary
         prompt_tokens = _estimate_tokens(prompt) + (_IMAGE_TOKEN_RESERVE if frame_b64 else 0)
-        guide_preview = brief.conversation_guide[:60] if brief.conversation_guide else ""
+        guide_preview = brief.conversation_guide[:80] if brief.conversation_guide else ""
         print(f"[Brain] #{self._think_count} {_C}{elapsed:.1f}s{_R} "
               f"| ~{prompt_tokens}tok "
               f"| {brief.speak_directive} "
               f"| {brief.scene[:50]}")
         if guide_preview:
             print(f"  guide: {guide_preview}")
+        if thinking:
+            print(f"  think: {thinking[:100]}{'…' if len(thinking) > 100 else ''}")
 
         # Save full log to file
         log_data = {
@@ -270,12 +272,25 @@ class BrainEngine:
             "cycle": self._think_count,
             "elapsed_s": round(elapsed, 2),
             "input": {
+                "model": self._model,
+                "options": {"num_ctx": config.MODEL_NUM_CTX},
+                "think": False,
                 "prompt": prompt,
                 "has_image": frame_b64 is not None,
                 "image_file": f"{log_prefix}_input.jpg" if frame_b64 else None,
+                "token_estimates": {
+                    "prompt": _estimate_tokens(prompt),
+                    "image_reserve": _IMAGE_TOKEN_RESERVE if frame_b64 else 0,
+                    "output_reserve": _OUTPUT_TOKEN_RESERVE,
+                    "total_input": prompt_tokens,
+                    "budget": config.MODEL_NUM_CTX,
+                },
             },
             "output": {
                 "raw": raw,
+                "thinking": thinking,
+                "tokens_est": _estimate_tokens(raw),
+                "thinking_tokens_est": _estimate_tokens(thinking) if thinking else 0,
                 "parsed": {
                     "scene": brief.scene,
                     "mood_hint": brief.mood_hint,
@@ -315,12 +330,11 @@ class BrainEngine:
 
     async def _call_ollama(
         self, prompt: str, image_b64: str | None
-    ) -> str | None:
-        """Call the brain model via Ollama native /api/chat with num_ctx.
+    ) -> tuple[str | None, str]:
+        """Call the brain model via Ollama native /api/chat with thinking enabled.
 
-        Using native API instead of OpenAI-compatible endpoint ensures
-        num_ctx is always passed, preventing Ollama from reloading the
-        model with default 128k context (which explodes VRAM).
+        Returns (content, thinking) tuple. thinking contains the model's
+        chain-of-thought reasoning (empty string if none).
         """
         messages = []
 
@@ -340,8 +354,9 @@ class BrainEngine:
         body = {
             "model": self._model,
             "messages": messages,
-            "options": {"num_ctx": config.BRAIN_NUM_CTX},
+            "options": {"num_ctx": config.MODEL_NUM_CTX},
             "stream": False,
+            "think": False,
         }
 
         try:
@@ -353,10 +368,13 @@ class BrainEngine:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                return data.get("message", {}).get("content", "").strip()
+                msg = data.get("message", {})
+                content = msg.get("content", "").strip()
+                thinking = msg.get("thinking", "").strip()
+                return content, thinking
         except Exception as e:
             print(f"[Brain] LLM error: {e}")
-            return None
+            return None, ""
 
     # ── brain prompt ──────────────────────────────────────────────────────────
 
@@ -375,7 +393,7 @@ class BrainEngine:
           variable_budget is split: transcript 50%, memories 25%, prev_scene 15%, slack 10%
         """
         image_tokens = _IMAGE_TOKEN_RESERVE if has_image else 0
-        text_budget = config.BRAIN_NUM_CTX - image_tokens - _OUTPUT_TOKEN_RESERVE
+        text_budget = config.MODEL_NUM_CTX - image_tokens - _OUTPUT_TOKEN_RESERVE
 
         # Estimate template fixed text (placeholders → empty)
         template_fixed_tokens = _estimate_tokens(
@@ -472,7 +490,7 @@ class BrainEngine:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _format_recent_transcript(self, max_entries: int = 6) -> str:
+    def _format_recent_transcript(self, max_entries: int = config.BRAIN_TRANSCRIPT_ENTRIES) -> str:
         """Merge recent user and bot texts into a chronological transcript."""
         combined: list[tuple[float, str, str]] = []
         for ts, txt in self._recent_user_texts:
@@ -486,7 +504,7 @@ class BrainEngine:
             return ""
         return "\n".join(f"{who}: {txt}" for _, who, txt in combined)
 
-    def _trim_recent(self, max_age: float = 300.0, max_count: int = 20) -> None:
+    def _trim_recent(self, max_age: float = config.BRAIN_RECENT_MAX_AGE, max_count: int = config.BRAIN_RECENT_MAX_COUNT) -> None:
         cutoff = time.monotonic() - max_age
         self._recent_user_texts = [
             (t, s) for t, s in self._recent_user_texts if t > cutoff

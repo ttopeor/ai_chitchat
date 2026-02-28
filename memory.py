@@ -158,8 +158,9 @@ class MemoryManager:
         body = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
-            "options": {"num_ctx": config.BRAIN_NUM_CTX},
+            "options": {"num_ctx": config.MODEL_NUM_CTX},
             "stream": False,
+            "think": False,
         }
 
         try:
