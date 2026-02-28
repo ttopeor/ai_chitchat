@@ -1,0 +1,15 @@
+# Audio I/O
+sounddevice
+numpy
+
+# STT
+faster-whisper
+
+# LLM (OpenAI-compatible client)
+openai
+
+# TTS
+chattts-fork
+
+# Note: torch/torchvision/torchaudio are installed by setup.sh from the
+# CUDA 12.4 index to ensure version coherence. Do not add them here.
