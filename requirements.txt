@@ -20,3 +20,6 @@ opencv-python-headless
 # Screen
 mss
 pillow
+
+# Tools (web browsing)
+duckduckgo-search

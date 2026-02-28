@@ -36,6 +36,7 @@ import torch
 from faster_whisper import WhisperModel
 import httpx
 import config
+from tools import TOOL_DEFINITIONS, execute_tool
 
 
 # ── Ollama model lifecycle ────────────────────────────────────────────────────
@@ -541,26 +542,88 @@ class VoiceBot:
     async def _stream_and_speak(
         self, messages: list[dict], label: str = "bot"
     ) -> str:
-        """Stream tokens from conv model via native Ollama API, split into sentences, pipe to TTS.
-        Returns the full generated text.
+        """Stream tokens with optional tool calling, pipe to TTS.
 
-        Uses /api/chat with num_ctx to prevent Ollama from reloading the model
-        with default 128k context (which would evict both pinned models).
+        If TOOLS_ENABLED: streams with tools parameter, detects tool_calls,
+        executes tools, and retries up to TOOLS_MAX_ROUNDS times.
+        Otherwise: streams directly to TTS as before.
+        """
+        if not config.TOOLS_ENABLED:
+            _, full_text = await self._stream_or_call_tools(messages, label, use_tools=False)
+            self._log_conv(messages, full_text or "", label)
+            return full_text or ""
+
+        current_messages = list(messages)
+        tool_log: list[dict] = []
+
+        for round_num in range(config.TOOLS_MAX_ROUNDS):
+            tool_calls, full_text = await self._stream_or_call_tools(
+                current_messages, label, use_tools=True,
+            )
+
+            if full_text is not None:
+                # Model responded with text — done
+                self._log_conv(current_messages, full_text, label, tool_log)
+                return full_text
+
+            if not tool_calls:
+                # No tool calls and no content — shouldn't happen
+                self._log_conv(current_messages, "", label, tool_log)
+                return ""
+
+            # Execute all tool calls in parallel
+            print(f"  [tools] round {round_num + 1}: {len(tool_calls)} call(s)")
+            current_messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": tool_calls,
+            })
+
+            results = await asyncio.gather(*[
+                execute_tool(
+                    tc["function"]["name"],
+                    tc["function"].get("arguments", {}),
+                )
+                for tc in tool_calls
+            ])
+
+            for tc, result in zip(tool_calls, results):
+                name = tc["function"]["name"]
+                print(f"  [tool] {name} → {result[:100]}")
+                current_messages.append({"role": "tool", "content": result})
+                tool_log.append({"name": name, "args": tc["function"].get("arguments", {}), "result": result[:200]})
+
+        # Max rounds exceeded — force response without tools
+        tool_calls, full_text = await self._stream_or_call_tools(
+            current_messages, label, use_tools=False,
+        )
+        self._log_conv(current_messages, full_text or "", label, tool_log)
+        return full_text or ""
+
+    async def _stream_or_call_tools(
+        self, messages: list[dict], label: str, use_tools: bool,
+    ) -> tuple[list[dict] | None, str | None]:
+        """Stream Ollama response with lazy TTS pipeline startup.
+
+        Returns (tool_calls, None) if model requested tools,
+        or (None, full_text) if model responded with content.
+
+        TTS pipeline is only started when the first content token arrives,
+        so tool-call rounds add zero TTS overhead.
         """
         loop = asyncio.get_running_loop()
+        tool_calls_collected: list[dict] = []
         full = ""
         buf  = ""
         t_llm = time.perf_counter()
         t_first_tok = None
         t_tts_start = None
-        print(f"[{label}] ", end="", flush=True)
-
-        self.bot_speaking.set()
-        synth_future = loop.run_in_executor(None, self._synthesize_worker)
-        play_future  = loop.run_in_executor(None, self._playback_worker)
+        tts_started = False
+        synth_future = None
+        play_future  = None
 
         try:
-            body = {
+            body: dict = {
                 "model": config.CONV_MODEL,
                 "messages": messages,
                 "options": {
@@ -568,8 +631,11 @@ class VoiceBot:
                     "num_predict": config.CONV_NUM_PREDICT,
                 },
                 "stream": True,
-                "think": False,   # disable thinking at API level (prompt /no_think alone isn't enough)
+                "think": False,
             }
+            if use_tools:
+                body["tools"] = TOOL_DEFINITIONS
+
             async with httpx.AsyncClient() as client:
                 async with client.stream(
                     "POST",
@@ -586,10 +652,28 @@ class VoiceBot:
                         except json.JSONDecodeError:
                             continue
 
-                        tok = data.get("message", {}).get("content", "")
-                        if tok and t_first_tok is None:
-                            t_first_tok = time.perf_counter()
+                        msg = data.get("message", {})
+
+                        # Collect tool calls (mutually exclusive with content)
+                        tc = msg.get("tool_calls")
+                        if tc:
+                            tool_calls_collected.extend(tc)
+
+                        # Process content tokens
+                        tok = msg.get("content", "")
                         if tok:
+                            # Lazy TTS pipeline startup on first content token
+                            if not tts_started:
+                                tts_started = True
+                                self.bot_speaking.set()
+                                synth_future = loop.run_in_executor(
+                                    None, self._synthesize_worker)
+                                play_future = loop.run_in_executor(
+                                    None, self._playback_worker)
+                                print(f"[{label}] ", end="", flush=True)
+
+                            if t_first_tok is None:
+                                t_first_tok = time.perf_counter()
                             print(tok, end="", flush=True)
                             full += tok
                             buf  += tok
@@ -607,7 +691,7 @@ class VoiceBot:
                             break
 
             # Flush trailing text
-            if buf.strip() and not self.interrupt.is_set():
+            if buf.strip() and not self.interrupt.is_set() and tts_started:
                 if t_tts_start is None:
                     t_tts_start = time.perf_counter()
                 self._synth_q.put(buf.strip())
@@ -615,30 +699,52 @@ class VoiceBot:
         except Exception as e:
             print(f"\n[LLM error] {e}")
         finally:
-            self._synth_q.put(None)
-            await synth_future
-            await play_future
-            self.bot_speaking.clear()
+            if tts_started:
+                self._synth_q.put(None)
+                await synth_future
+                await play_future
+                self.bot_speaking.clear()
 
-            self._drain_queue(self._synth_q)
-            self._drain_queue(self._audio_q)
+                self._drain_queue(self._synth_q)
+                self._drain_queue(self._audio_q)
 
-            ttft = (t_first_tok - t_llm) if t_first_tok else 0
-            tts_elapsed = (time.perf_counter() - t_tts_start) if t_tts_start else 0
-            print(f"  | TTFT {_C}{ttft:.2f}s{_R} | TTS+play {_C}{tts_elapsed:.2f}s{_R}")
-            self.interrupt.clear()
+                ttft = (t_first_tok - t_llm) if t_first_tok else 0
+                tts_elapsed = (time.perf_counter() - t_tts_start) if t_tts_start else 0
+                print(f"  | TTFT {_C}{ttft:.2f}s{_R} | TTS+play {_C}{tts_elapsed:.2f}s{_R}")
+                self.interrupt.clear()
 
-        # Save detailed conv log (full input/output for token analysis)
+        if tool_calls_collected and not full:
+            return tool_calls_collected, None
+        return None, full
+
+    def _log_conv(
+        self,
+        messages: list[dict],
+        full: str,
+        label: str,
+        tool_log: list[dict] | None = None,
+    ) -> None:
+        """Save detailed conv log (full input/output for token analysis)."""
         self._conv_call_count += 1
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_data = {
+
+        # Safely estimate tokens — messages may contain tool_calls without "content"
+        per_message = []
+        total_input = 0
+        for m in messages:
+            content = m.get("content", "")
+            tok_est = _estimate_tokens(content) if content else 0
+            per_message.append({
+                "role": m["role"],
+                "tokens": tok_est,
+                "chars": len(content) if content else 0,
+            })
+            total_input += tok_est
+
+        log_data: dict = {
             "timestamp": datetime.now().isoformat(),
             "cycle": self._conv_call_count,
             "label": label,
-            "timing": {
-                "ttft_s": round(ttft, 2),
-                "tts_play_s": round(tts_elapsed, 2),
-            },
             "input": {
                 "model": config.CONV_MODEL,
                 "options": {
@@ -648,11 +754,8 @@ class VoiceBot:
                 "think": False,
                 "messages": messages,
                 "token_estimates": {
-                    "per_message": [
-                        {"role": m["role"], "tokens": _estimate_tokens(m["content"]), "chars": len(m["content"])}
-                        for m in messages
-                    ],
-                    "total_input": sum(_estimate_tokens(m["content"]) for m in messages),
+                    "per_message": per_message,
+                    "total_input": total_input,
                     "output_reserve": config.CONV_OUTPUT_RESERVE,
                     "budget": config.MODEL_NUM_CTX,
                 },
@@ -662,10 +765,10 @@ class VoiceBot:
                 "tokens_est": _estimate_tokens(full),
             },
         }
+        if tool_log:
+            log_data["tools"] = tool_log
         log_path = _CONV_DETAIL_DIR / f"{ts}_{self._conv_call_count:04d}_{label}.json"
         log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2))
-
-        return full
 
     # ── main pipeline ─────────────────────────────────────────────────────────
 
