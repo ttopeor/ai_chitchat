@@ -27,5 +27,7 @@ MIC_DEVICE     = None
 SPEAKER_DEVICE = None   # None = system default speaker
 
 # ── VAD (Silero) ──────────────────────────────────────────────────────────────
-VAD_THRESHOLD = 0.5    # speech probability threshold [0, 1]
-SILENCE_S     = 0.8    # seconds of silence before treating utterance as complete
+VAD_THRESHOLD           = 0.5    # speech probability threshold [0, 1]
+VAD_THRESHOLD_INTERRUPT = 0.80   # higher threshold during bot speech to reject residual echo
+INTERRUPT_MIN_FRAMES    = 3      # consecutive speech frames to trigger interrupt (each ~32ms)
+SILENCE_S               = 0.8    # seconds of silence before treating utterance as complete

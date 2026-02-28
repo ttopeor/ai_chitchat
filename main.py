@@ -7,6 +7,7 @@ VoiceBot — local STT → LLM → TTS voice chat
 """
 import asyncio
 import re
+import subprocess
 import threading
 import time
 
@@ -38,6 +39,37 @@ def pop_sentence(buf: str) -> tuple[str, str]:
                 return buf[:idx].strip(), buf[idx + 1:]
         return buf[:_MAX_BUF].strip(), buf[_MAX_BUF:]
     return "", buf
+
+
+# ── PipeWire AEC routing ──────────────────────────────────────────────────────
+
+ENABLE_AEC       = False  # Set True to route audio through PipeWire Echo Cancellation
+ENABLE_INTERRUPT = False  # Set True to allow user to interrupt bot mid-speech
+
+
+def _setup_aec():
+    """Set PipeWire Echo Cancellation nodes as default source/sink."""
+    if not ENABLE_AEC:
+        print("  AEC disabled (ENABLE_AEC = False)")
+        return
+    try:
+        result = subprocess.run(
+            ["wpctl", "status"], capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if "Echo Cancellation Source" in stripped:
+                node_id = stripped.split(".")[0]
+                subprocess.run(["wpctl", "set-default", node_id], timeout=5)
+                print(f"  AEC source → node {node_id}")
+            elif "Echo Cancellation Sink" in stripped:
+                node_id = stripped.split(".")[0]
+                subprocess.run(["wpctl", "set-default", node_id], timeout=5)
+                print(f"  AEC sink   → node {node_id}")
+    except FileNotFoundError:
+        print("  ⚠ wpctl not found — PipeWire AEC not configured")
+    except Exception as e:
+        print(f"  ⚠ AEC setup failed: {e}")
 
 
 # ── VoiceBot ──────────────────────────────────────────────────────────────────
@@ -105,6 +137,10 @@ class VoiceBot:
         buf: list[np.ndarray] = []
         in_speech = False
         silence_n = 0
+        interrupt_count = 0  # consecutive speech frames while bot is speaking
+        bot_was_speaking = False
+        cooldown_n = 0  # frames to skip after bot stops speaking
+        COOLDOWN_FRAMES = int(0.5 * config.MIC_SAMPLE_RATE / CHUNK)  # 0.5s
 
         def cb(indata, *_):
             loop.call_soon_threadsafe(
@@ -123,14 +159,43 @@ class VoiceBot:
             print("\n🎙️  Ready — speak now.\n")
             while True:
                 chunk = await self._raw_q.get()
-                is_speech = self._vad_prob(chunk) > config.VAD_THRESHOLD
+
+                # Cooldown after bot finishes speaking — discard residual echo
+                bot_speaking_now = self.bot_speaking.is_set()
+                if bot_was_speaking and not bot_speaking_now:
+                    cooldown_n = COOLDOWN_FRAMES
+                    buf.clear()
+                    in_speech = False
+                    silence_n = 0
+                bot_was_speaking = bot_speaking_now
+
+                if cooldown_n > 0:
+                    cooldown_n -= 1
+                    continue
+
+                prob = self._vad_prob(chunk)
+
+                # Adaptive threshold: higher when bot speaks to reject echo
+                threshold = (
+                    config.VAD_THRESHOLD_INTERRUPT
+                    if bot_speaking_now
+                    else config.VAD_THRESHOLD
+                )
+                is_speech = prob > threshold
 
                 if is_speech:
                     if not in_speech:
-                        in_speech = True
-                        # Interrupt bot mid-sentence if it's speaking
-                        if self.bot_speaking.is_set():
-                            self.interrupt.set()
+                        if bot_speaking_now:
+                            if not ENABLE_INTERRUPT:
+                                continue
+                            # Require consecutive frames before triggering interrupt
+                            interrupt_count += 1
+                            if interrupt_count >= config.INTERRUPT_MIN_FRAMES:
+                                in_speech = True
+                                self.interrupt.set()
+                                interrupt_count = 0
+                        else:
+                            in_speech = True
                     buf.append(chunk)
                     silence_n = 0
                 elif in_speech:
@@ -141,6 +206,9 @@ class VoiceBot:
                         buf.clear()
                         in_speech = False
                         silence_n = 0
+                else:
+                    interrupt_count = 0
+                    buf.clear()
 
     # ── STT ───────────────────────────────────────────────────────────────────
 
@@ -166,7 +234,7 @@ class VoiceBot:
             "top_P": 0.7,
             "top_K": 20,
         }
-        wavs = self.tts.infer([text], skip_refine_text=True, params_infer_code=params)
+        wavs = self.tts.infer([text], skip_refine_text=False, params_infer_code=params)
 
         if not wavs or wavs[0] is None or self.interrupt.is_set():
             return
@@ -174,6 +242,10 @@ class VoiceBot:
         audio = np.squeeze(wavs[0]).astype(np.float32)
         if len(audio) == 0 or self.interrupt.is_set():
             return
+
+        # Pad with 100ms silence at start/end to prevent clipping from OutputStream open/close
+        pad = np.zeros(int(0.1 * self.tts_sr), dtype=np.float32)
+        audio = np.concatenate([pad, audio, pad])
 
         idx   = [0]
         done  = threading.Event()
@@ -281,6 +353,9 @@ class VoiceBot:
 
     async def run(self) -> None:
         loop  = asyncio.get_running_loop()
+
+        print("Setting up PipeWire AEC…")
+        _setup_aec()
 
         # Whisper CUDA JIT warmup
         dummy = np.zeros(16000, dtype=np.float32)
