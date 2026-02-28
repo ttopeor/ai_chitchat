@@ -6,10 +6,19 @@ VoiceBot — local STT → LLM → TTS voice chat
   VAD : Silero VAD
 """
 import asyncio
+import logging
+import queue
 import re
 import subprocess
 import threading
 import time
+import os
+
+os.environ['TQDM_DISABLE'] = '1'
+
+# Silence noisy third-party loggers (keep WARNING and above)
+for _name in ("faster_whisper", "httpx", "ChatTTS", "onnxruntime"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 import ChatTTS
 import numpy as np
@@ -20,11 +29,15 @@ from openai import AsyncOpenAI
 
 import config
 
+# ANSI color for timing output
+_C = "\033[36m"   # cyan
+_R = "\033[0m"    # reset
+
 
 # ── sentence splitter ─────────────────────────────────────────────────────────
 
 _SENT_RE = re.compile(r'[。！？\n]|(?<=[.!?])[ \t]')
-_MAX_BUF = 60   # force-flush if no punctuation found within this many chars
+_MAX_BUF = 200   # force-flush if no punctuation found within this many chars
 
 
 def pop_sentence(buf: str) -> tuple[str, str]:
@@ -100,7 +113,7 @@ class VoiceBot:
         finally:
             torch.load = _orig_load
         self.tts_sr = 24000                   # ChatTTS always outputs 24 kHz
-        self._tts_spk = self.tts.sample_random_speaker(seed=42)  # fixed voice for session
+        self._tts_spk = self.tts.sample_random_speaker(seed=config.CHATTTS_SEED)
 
         print("Connecting to LLM…")
         self.llm = AsyncOpenAI(
@@ -118,6 +131,10 @@ class VoiceBot:
 
         self._raw_q:   asyncio.Queue[np.ndarray] = asyncio.Queue()
         self.speech_q: asyncio.Queue[np.ndarray] = asyncio.Queue()
+
+        # TTS pipeline queues: text → synthesis → audio → playback
+        self._synth_q: queue.Queue[str | None]       = queue.Queue()
+        self._audio_q: queue.Queue[np.ndarray | None] = queue.Queue()
 
     # ── VAD ───────────────────────────────────────────────────────────────────
 
@@ -221,69 +238,91 @@ class VoiceBot:
 
         return await loop.run_in_executor(None, _run)
 
-    # ── TTS + playback ────────────────────────────────────────────────────────
+    # ── TTS pipeline workers ─────────────────────────────────────────────────
 
-    def _play_blocking(self, text: str) -> None:
-        """Synthesize one sentence and play it. Runs in a thread-pool worker."""
-        if self.interrupt.is_set():
-            return
+    def _synthesize_worker(self) -> None:
+        """Pull text from _synth_q, synthesize, push audio to _audio_q.
+        Runs in a thread-pool thread. Stops on None sentinel or interrupt."""
+        while True:
+            text = self._synth_q.get()
+            if text is None:
+                self._audio_q.put(None)
+                break
+            if self.interrupt.is_set():
+                self._drain_queue(self._synth_q)
+                self._audio_q.put(None)
+                break
 
-        params = {
-            "spk_emb": self._tts_spk,
-            "temperature": config.CHATTTS_TEMPERATURE,
-            "top_P": 0.7,
-            "top_K": 20,
-        }
-        wavs = self.tts.infer([text], skip_refine_text=False, params_infer_code=params)
+            # Fresh dict each call — ChatTTS mutates params_infer_code internally
+            params = {
+                "spk_emb": self._tts_spk,
+                "temperature": config.CHATTTS_TEMPERATURE,
+                "top_P": 0.7,
+                "top_K": 20,
+            }
+            wavs = self.tts.infer([text], skip_refine_text=False, params_infer_code=params)
 
-        if not wavs or wavs[0] is None or self.interrupt.is_set():
-            return
+            if self.interrupt.is_set():
+                self._drain_queue(self._synth_q)
+                self._audio_q.put(None)
+                break
 
-        audio = np.squeeze(wavs[0]).astype(np.float32)
-        if len(audio) == 0 or self.interrupt.is_set():
-            return
+            if wavs and wavs[0] is not None:
+                audio = np.squeeze(wavs[0]).astype(np.float32)
+                if len(audio) > 0:
+                    pre  = np.zeros(int(0.05 * self.tts_sr), dtype=np.float32)
+                    post = np.zeros(int(0.3  * self.tts_sr), dtype=np.float32)
+                    audio = np.concatenate([pre, audio, post])
+                    self._audio_q.put(audio)
 
-        # Pad with 100ms silence at start/end to prevent clipping from OutputStream open/close
-        pad = np.zeros(int(0.1 * self.tts_sr), dtype=np.float32)
-        audio = np.concatenate([pad, audio, pad])
+    def _playback_worker(self) -> None:
+        """Pull audio from _audio_q, play sequentially.
+        Runs in a thread-pool thread. Stops on None sentinel or interrupt."""
+        while True:
+            audio = self._audio_q.get()
+            if audio is None:
+                break
+            if self.interrupt.is_set():
+                self._drain_queue(self._audio_q)
+                break
 
-        idx   = [0]
-        done  = threading.Event()
+            idx  = [0]
+            done = threading.Event()
 
-        def cb(outdata, frames, *_):
-            rem = len(audio) - idx[0]
-            if rem <= 0 or self.interrupt.is_set():
-                outdata[:] = 0
-                raise sd.CallbackStop()
-            n               = min(frames, rem)
-            outdata[:n, 0]  = audio[idx[0]: idx[0] + n]
-            outdata[n:, 0]  = 0
-            idx[0]         += n
+            def cb(outdata, frames, *_):
+                rem = len(audio) - idx[0]
+                if rem <= 0 or self.interrupt.is_set():
+                    outdata[:] = 0
+                    raise sd.CallbackStop()
+                n               = min(frames, rem)
+                outdata[:n, 0]  = audio[idx[0]: idx[0] + n]
+                outdata[n:, 0]  = 0
+                idx[0]         += n
 
-        with sd.OutputStream(
-            samplerate=self.tts_sr,
-            channels=1,
-            dtype="float32",
-            device=config.SPEAKER_DEVICE,
-            blocksize=1024,
-            callback=cb,
-            finished_callback=done.set,
-        ):
-            done.wait()
+            with sd.OutputStream(
+                samplerate=self.tts_sr,
+                channels=1,
+                dtype="float32",
+                device=config.SPEAKER_DEVICE,
+                blocksize=1024,
+                callback=cb,
+                finished_callback=done.set,
+            ):
+                done.wait()
 
-    async def _speak(self, text: str) -> None:
-        if not text:
-            return
-        loop = asyncio.get_running_loop()
-        self.bot_speaking.set()
-        try:
-            await loop.run_in_executor(None, self._play_blocking, text)
-        finally:
-            self.bot_speaking.clear()
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        """Discard all remaining items in a queue."""
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
 
     # ── main pipeline ─────────────────────────────────────────────────────────
 
     async def process_loop(self) -> None:
+        loop = asyncio.get_running_loop()
         while True:
             audio = await self.speech_q.get()
 
@@ -298,16 +337,22 @@ class VoiceBot:
             if not text:
                 continue
             stt_elapsed = time.perf_counter() - t_stt
-            print(f"👤 {text}  ⏱ STT {stt_elapsed:.2f}s")
+            print(f"👤 {text}  ⏱ STT {_C}{stt_elapsed:.2f}s{_R}")
 
-            # LLM stream → sentence-level TTS
+            # LLM stream → pipelined TTS
             self.history.append({"role": "user", "content": text})
             full = ""
             buf  = ""
-            tts_total = 0.0
             t_llm = time.perf_counter()
             t_first_tok = None
+            t_tts_start = None
             print("🤖 ", end="", flush=True)
+
+            # Launch synthesis and playback workers
+            self.bot_speaking.set()
+            synth_future = loop.run_in_executor(None, self._synthesize_worker)
+            play_future  = loop.run_in_executor(None, self._playback_worker)
+
             try:
                 stream = await self.llm.chat.completions.create(
                     model=config.LLM_MODEL,
@@ -325,9 +370,9 @@ class VoiceBot:
 
                     sent, buf = pop_sentence(buf)
                     if sent:
-                        t_tts = time.perf_counter()
-                        await self._speak(sent)
-                        tts_total += time.perf_counter() - t_tts
+                        if t_tts_start is None:
+                            t_tts_start = time.perf_counter()
+                        self._synth_q.put(sent)
 
                     if self.interrupt.is_set():
                         await stream.close()
@@ -335,16 +380,27 @@ class VoiceBot:
 
                 # Flush any trailing text
                 if buf.strip() and not self.interrupt.is_set():
-                    t_tts = time.perf_counter()
-                    await self._speak(buf.strip())
-                    tts_total += time.perf_counter() - t_tts
+                    if t_tts_start is None:
+                        t_tts_start = time.perf_counter()
+                    self._synth_q.put(buf.strip())
 
             except Exception as e:
                 print(f"\n[LLM error] {e}")
             finally:
-                llm_elapsed = time.perf_counter() - t_llm - tts_total
+                # Signal end of turn → workers will exit
+                self._synth_q.put(None)
+                await synth_future
+                await play_future
+                self.bot_speaking.clear()
+
+                # Defensive drain in case of interrupt leftovers
+                self._drain_queue(self._synth_q)
+                self._drain_queue(self._audio_q)
+
+                # Timing
                 ttft = (t_first_tok - t_llm) if t_first_tok else 0
-                print(f"  ⏱ LLM {llm_elapsed:.2f}s (TTFT {ttft:.2f}s) | TTS {tts_total:.2f}s")
+                tts_elapsed = (time.perf_counter() - t_tts_start) if t_tts_start else 0
+                print(f"  ⏱ LLM TTFT {_C}{ttft:.2f}s{_R} | TTS+play {_C}{tts_elapsed:.2f}s{_R}")
                 if full:
                     self.history.append({"role": "assistant", "content": full})
                 self.interrupt.clear()
@@ -364,16 +420,17 @@ class VoiceBot:
         await loop.run_in_executor(
             None, lambda: list(self.asr.transcribe(dummy)[0])
         )
-        print(f"  Whisper ready  ⏱ {time.perf_counter() - t0:.2f}s")
+        print(f"  Whisper ready  ⏱ {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
-        # ChatTTS warmup — triggers internal lazy init
+        # ChatTTS warmup — must match actual inference params (skip_refine_text=False)
+        # to exercise the refine_text pipeline and avoid garbled first output
         t0 = time.perf_counter()
         print("Warming up ChatTTS…")
         await loop.run_in_executor(
             None,
             lambda: self.tts.infer(
-                ["warmup"],
-                skip_refine_text=True,
+                ["你好世界"],
+                skip_refine_text=False,
                 params_infer_code={
                     "spk_emb": self._tts_spk,
                     "temperature": config.CHATTTS_TEMPERATURE,
@@ -382,7 +439,7 @@ class VoiceBot:
                 },
             ),
         )
-        print(f"  ChatTTS ready  ⏱ {time.perf_counter() - t0:.2f}s")
+        print(f"  ChatTTS ready  ⏱ {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
         # LLM warmup — preload model params to GPU on Ollama side
         t0 = time.perf_counter()
@@ -392,7 +449,7 @@ class VoiceBot:
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=1,
         )
-        print(f"  LLM ready      ⏱ {time.perf_counter() - t0:.2f}s")
+        print(f"  LLM ready      ⏱ {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
         print("\nAll models ready.\n")
         await asyncio.gather(self.mic_loop(), self.process_loop())
