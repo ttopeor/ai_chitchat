@@ -114,8 +114,8 @@ WHISPER_COMPUTE_TYPE = "float16"
 # ── TTS (ChatTTS) ─────────────────────────────────────────────────────────────
 CHATTTS_DEVICE      = "cuda"   # "cuda" or "cpu"
 CHATTTS_TEMPERATURE = 0.3      # lower = more stable output, less random artifacts
-CHATTTS_SEED        = 2        # speaker voice seed — try different values for different voices
-
+CHATTTS_SEED        = 1111     # speaker voice seed — try different values for different voices
+                               # Good seeds for "小悠" voice: 2, 1111, 42, 88, 1234.
 # ── Audio I/O ─────────────────────────────────────────────────────────────────
 MIC_SAMPLE_RATE = 16000
 # MIC_DEVICE: None = system default microphone

@@ -690,17 +690,17 @@ class VoiceBot:
             stt_elapsed = time.perf_counter() - t_stt
             print(f"[user] {text}  | STT {_C}{stt_elapsed:.2f}s{_R}")
 
-            # Notify brain of user speech
-            if self.brain:
-                self.brain.record_user_speech(text)
-
             # Relevance check: is this speech directed at 小悠?
             if self.brain and not self.brain.should_respond(text):
-                # Media playing → save transcription as media audio for later memory extraction
                 if self.brain.is_media_playing():
                     self.brain.record_media_audio(text)
+                self.brain.record_ambient_audio(text)
                 print("  (not directed at bot, ignoring)")
                 continue
+
+            # Confirmed user speech — record it
+            if self.brain:
+                self.brain.record_user_speech(text)
 
             # Append to conversation history
             self.history.append({"role": "user", "content": text})

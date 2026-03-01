@@ -109,6 +109,7 @@ class BrainEngine:
         # Observation tracking
         self._recent_user_texts: list[tuple[float, str]] = []   # (mono_ts, text)
         self._recent_bot_texts: list[tuple[float, str]] = []
+        self._recent_ambient_texts: list[tuple[float, str]] = []  # non-user audio (media/background)
         self._last_user_speech_time: float = 0.0
         self._last_bot_speech_time: float = 0.0
         self._last_autonomous_time: float = 0.0
@@ -143,6 +144,12 @@ class BrainEngine:
         now = time.monotonic()
         self._last_user_speech_time = now
         self._recent_user_texts.append((now, text))
+        self._trim_recent()
+
+    def record_ambient_audio(self, text: str) -> None:
+        """Record audio not directed at bot (media/background) for transcript context."""
+        now = time.monotonic()
+        self._recent_ambient_texts.append((now, text))
         self._trim_recent()
 
     def record_bot_speech(self, text: str) -> None:
@@ -186,8 +193,10 @@ class BrainEngine:
             return False
 
         # 5. Fallback: active conversation timeout (when brain state is stale)
-        if now - self._last_bot_speech_time < self._conversation_timeout:
-            return True
+        # But NOT during media playback — media audio shouldn't trigger responses
+        if not self.is_media_playing():
+            if now - self._last_bot_speech_time < self._conversation_timeout:
+                return True
 
         return False
 
@@ -746,6 +755,8 @@ class BrainEngine:
             combined.append((ts, "对方", txt))
         for ts, txt in self._recent_bot_texts:
             combined.append((ts, "小悠", txt))
+        for ts, txt in self._recent_ambient_texts:
+            combined.append((ts, "（视频/背景声）", txt))
         combined.sort(key=lambda x: x[0])
         combined = combined[-max_entries:]
 
@@ -760,4 +771,7 @@ class BrainEngine:
         ][-max_count:]
         self._recent_bot_texts = [
             (t, s) for t, s in self._recent_bot_texts if t > cutoff
+        ][-max_count:]
+        self._recent_ambient_texts = [
+            (t, s) for t, s in self._recent_ambient_texts if t > cutoff
         ][-max_count:]
