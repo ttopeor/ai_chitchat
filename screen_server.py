@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--port", type=int, default=7890)
     parser.add_argument("--monitor", type=int, default=None,
                         help="Monitor number (1-based). Default: widest.")
-    parser.add_argument("--width", type=int, default=1920,
+    parser.add_argument("--width", type=int, default=1280,
                         help="Scale target width in pixels.")
     parser.add_argument("--interval", type=float, default=2.0,
                         help="Capture interval in seconds.")

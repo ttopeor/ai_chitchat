@@ -22,4 +22,4 @@ mss
 pillow
 
 # Tools (web browsing)
-duckduckgo-search
+ddgs

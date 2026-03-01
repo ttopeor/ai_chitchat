@@ -31,6 +31,7 @@ import httpx
 import config
 from memory import MemoryEntry, MemoryManager
 from screen import ScreenCapture
+from tools import web_search
 from vision import CameraCapture
 
 # ANSI
@@ -64,7 +65,8 @@ def _estimate_tokens(text: str) -> int:
 @dataclass
 class ContextBrief:
     """Digested context that the 7b model reads before replying."""
-    scene: str = ""                # what the camera sees right now
+    scene: str = ""                # what the camera sees (physical environment)
+    screen: str = ""               # what's on the computer screen (digital content)
     memories: str = ""             # relevant memories, pre-formatted
     mood_hint: str = ""            # assessment of the user's current state
     speak_directive: str = "LISTEN"  # LISTEN / RESPOND / INITIATE:intent
@@ -112,6 +114,7 @@ class BrainEngine:
         self._last_autonomous_time: float = 0.0
         self._last_memory_extract_time: float = 0.0
         self._prev_scene: str = ""
+        self._prev_screen: str = ""
 
         # Conversation boundary tracking
         self._conversation_history_snapshot: list[dict] | None = None
@@ -119,9 +122,14 @@ class BrainEngine:
         # Dynamic background (synthesized from memory at startup, refreshed on new memories)
         self._dynamic_background: str = ""
 
-        # Media audio buffer (STT transcriptions captured during media playback)
+        # Media tracking
         self._media_audio_buffer: list[str] = []
         self._last_media_memory_time: float = 0.0
+        self._last_media_detected_time: float = 0.0  # for hysteresis
+
+        # Web search state (brain executes tools, feeds results to mouth via guide)
+        self._search_result: str | None = None
+        self._search_delivered: bool = True
 
         # Think cycle counter (for log filenames)
         self._think_count = 0
@@ -148,7 +156,15 @@ class BrainEngine:
         return self._brief
 
     def should_respond(self, text: str) -> bool:
-        """Quick heuristic: is this speech directed at 小悠?"""
+        """Decide whether incoming speech is directed at 小悠.
+
+        Priority chain (higher = checked first):
+          1. Name mentioned      → always respond
+          2. Brain uninitialized  → respond (startup fallback)
+          3. Brain says RESPOND   → respond (brain judged: user is talking to you)
+          4. Brain says LISTEN + fresh (<15s) → don't respond (trust brain)
+          5. Conversation timeout → respond (brain stale, fallback)
+        """
         # 1. Name mentioned → always respond
         name_variants = ("小悠", "小優", "小尤", "小游", "小由", "小油")
         if any(n in text for n in name_variants):
@@ -158,25 +174,28 @@ class BrainEngine:
         if self._brief.updated_at == 0.0:
             return True
 
-        # 3. Media playing → only respond if brain says RESPOND
-        #    (skip conversation timeout to filter out media audio)
-        if self._brief.media_playing:
-            return self._brief.speak_directive == "RESPOND"
-
-        # 4. Active conversation (recent exchange within timeout)
-        now = time.monotonic()
-        if now - self._last_bot_speech_time < self._conversation_timeout:
+        # 3. Brain says RESPOND → respond (brain explicitly judged: directed at bot)
+        if self._brief.speak_directive == "RESPOND":
             return True
 
-        # 5. Current directive from brain
-        if self._brief.speak_directive == "RESPOND":
+        # 4. Brain says LISTEN and is fresh → respect it
+        #    (covers both media playback and non-media situations)
+        now = time.monotonic()
+        brain_age = now - self._brief.updated_at
+        if self._brief.speak_directive == "LISTEN" and brain_age < 15:
+            return False
+
+        # 5. Fallback: active conversation timeout (when brain state is stale)
+        if now - self._last_bot_speech_time < self._conversation_timeout:
             return True
 
         return False
 
     def is_media_playing(self) -> bool:
-        """Check if the brain detects media playing on screen."""
-        return self._brief.media_playing
+        """Check if media is playing (with 30s hysteresis to prevent flicker)."""
+        if self._brief.media_playing:
+            return True
+        return time.monotonic() - self._last_media_detected_time < 30
 
     def record_media_audio(self, text: str) -> None:
         """Buffer transcribed media audio for later memory extraction."""
@@ -251,6 +270,12 @@ class BrainEngine:
                 await asyncio.sleep(1.0)
                 continue
 
+            # Yield GPU to mouth: user spoke but mouth hasn't replied yet
+            if (self._last_user_speech_time > self._last_bot_speech_time
+                    and time.monotonic() - self._last_user_speech_time < 5.0):
+                await asyncio.sleep(0.5)
+                continue
+
             # Dynamic interval based on conversation activity
             now = time.monotonic()
             last_speech = max(
@@ -264,8 +289,8 @@ class BrainEngine:
             else:
                 silence = now - last_speech
                 if silence < self._conversation_timeout:
-                    # Active conversation — run continuously
-                    await asyncio.sleep(0.5)
+                    # Active conversation — think every few seconds
+                    await asyncio.sleep(3.0)
                 elif silence < 120:
                     # Recent conversation ended — normal interval
                     await asyncio.sleep(self._interval)
@@ -328,6 +353,39 @@ class BrainEngine:
 
         # Parse structured output
         brief = self._parse_brain_output(raw)
+
+        # ── Execute [SEARCH] if brain requested one ──────────────────────
+        search_match = re.search(r"\[SEARCH\]\s*(.+)", raw)
+        if search_match:
+            query = search_match.group(1).strip()
+            if query and query != "无":
+                print(f"  {_C}[search]{_R} {query}")
+                try:
+                    result = await asyncio.wait_for(
+                        web_search(query), timeout=config.TOOLS_TIMEOUT
+                    )
+                    self._search_result = result
+                    self._search_delivered = False
+                    print(f"  {_C}[search]{_R} {query} → {len(result)} chars")
+                except Exception as e:
+                    print(f"  {_C}[search error]{_R} {e}")
+                    self._search_result = f"搜索'{query}'时出错了。"
+                    self._search_delivered = False
+
+        # If we have undelivered search results, inject into guide + INITIATE
+        search_initiated = False
+        if self._search_result and not self._search_delivered:
+            result_preview = self._search_result[:500]
+            brief.conversation_guide = (
+                f"你刚查到了以下信息，用口语简短告诉越哥：\n{result_preview}\n\n"
+                + (brief.conversation_guide or "")
+            )
+            brief.speak_directive = (
+                f"INITIATE:查到了信息，自然地告诉越哥搜索结果"
+            )
+            self._search_delivered = True
+            search_initiated = True
+
         elapsed = time.perf_counter() - t0
 
         # Console summary
@@ -341,7 +399,8 @@ class BrainEngine:
         print(f"[Brain] #{self._think_count} {_C}{elapsed:.1f}s{_R} "
               f"| ~{prompt_tokens}tok "
               f"| {brief.speak_directive} "
-              f"| {brief.scene[:50]}")
+              f"| scene:{brief.scene[:40]} "
+              f"| screen:{brief.screen[:30]}")
         if guide_preview:
             print(f"  guide: {guide_preview}")
         if thinking:
@@ -376,6 +435,7 @@ class BrainEngine:
                 "thinking_tokens_est": _estimate_tokens(thinking) if thinking else 0,
                 "parsed": {
                     "scene": brief.scene,
+                    "screen": brief.screen,
                     "mood_hint": brief.mood_hint,
                     "speak_directive": brief.speak_directive,
                     "conversation_guide": brief.conversation_guide,
@@ -386,6 +446,10 @@ class BrainEngine:
         }
         log_path = _LOG_DIR / f"{log_prefix}_think.json"
         log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2))
+
+        # Track media detection timestamp for hysteresis
+        if brief.media_playing:
+            self._last_media_detected_time = time.monotonic()
 
         # Handle memory notes (cooldown: at most once per 60s)
         if brief.memory_note and brief.memory_note != "无" and self._memory:
@@ -406,7 +470,8 @@ class BrainEngine:
         if brief.speak_directive.startswith("INITIATE:"):
             intent = brief.speak_directive[len("INITIATE:"):].strip()
             if intent and not self._get_bot_speaking():
-                cooldown_ok = (
+                # Search results bypass cooldown — user explicitly asked
+                cooldown_ok = search_initiated or (
                     time.monotonic() - self._last_autonomous_time
                     > self._autonomous_cooldown
                 )
@@ -415,6 +480,7 @@ class BrainEngine:
                     asyncio.create_task(self._on_autonomous_speech(intent))
 
         self._prev_scene = brief.scene
+        self._prev_screen = brief.screen
 
         async with self._lock:
             self._brief = brief
@@ -473,7 +539,7 @@ class BrainEngine:
 
         Token budget breakdown:
           BRAIN_NUM_CTX - image_reserve - output_reserve - template_fixed = variable_budget
-          variable_budget is split: transcript 50%, memories 25%, prev_scene 15%, slack 10%
+          variable_budget is split: transcript 50%, memories 25%, prev_scene 10%, prev_screen 5%, slack 10%
         """
         image_tokens = 0
         if num_images >= 1:
@@ -485,17 +551,23 @@ class BrainEngine:
         # Estimate template fixed text (placeholders → empty)
         template_fixed_tokens = _estimate_tokens(
             config.BRAIN_PROMPT_TEMPLATE.format(
-                prev_scene="", transcript="", memories="",
-                silence=0, autonomous_gap=0,
+                prev_scene="", prev_screen="", transcript="", memories="",
+                silence=0, autonomous_gap=0, search_state="",
             )
         )
         variable_budget = max(text_budget - template_fixed_tokens, 200)
 
-        # Prepare prev_scene (cap at 15% of variable budget)
-        max_prev_tokens = int(variable_budget * 0.15)
+        # Prepare prev_scene (cap at 10% of variable budget)
+        max_prev_tokens = int(variable_budget * 0.10)
         prev = self._prev_scene if self._prev_scene else "（第一次观察）"
         while _estimate_tokens(prev) > max_prev_tokens and len(prev) > 20:
             prev = prev[:int(len(prev) * 0.7)] + "..."
+
+        # Prepare prev_screen (cap at 5% of variable budget)
+        max_prev_screen_tokens = int(variable_budget * 0.05)
+        prev_scr = self._prev_screen if self._prev_screen else "（第一次观察）"
+        while _estimate_tokens(prev_scr) > max_prev_screen_tokens and len(prev_scr) > 20:
+            prev_scr = prev_scr[:int(len(prev_scr) * 0.7)] + "..."
 
         # Prepare transcript (50% of variable budget, keep most recent)
         max_transcript_tokens = int(variable_budget * 0.5)
@@ -517,12 +589,21 @@ class BrainEngine:
                 else:
                     memories = memories[:int(len(memories) * 0.6)] + "..."
 
+        # Build search state hint for the brain
+        search_state = ""
+        if self._search_result and not self._search_delivered:
+            search_state = f"【搜索结果待传达】你已查到：{self._search_result[:300]}\n建议用INITIATE把结果告诉越哥。"
+        elif self._search_result and self._search_delivered:
+            search_state = "【搜索结果已传达】你之前查到的信息已经告诉越哥了。"
+
         prompt = config.BRAIN_PROMPT_TEMPLATE.format(
             prev_scene=prev,
+            prev_screen=prev_scr,
             transcript=transcript if transcript else "（最近没有对话）",
             memories=memories if memories else "（暂无记忆）",
             silence=silence,
             autonomous_gap=autonomous_gap,
+            search_state=search_state if search_state else "（无待处理的搜索）",
         )
 
         # Final safety: hard-truncate if still over budget
@@ -545,8 +626,16 @@ class BrainEngine:
         media_str = extract("MEDIA")
         media_playing = media_str.upper().startswith("Y") if media_str else False
 
+        # For screen: treat "无变化" as keeping previous screen state
+        screen_raw = extract("SCREEN")
+        if screen_raw and screen_raw != "无变化":
+            screen = screen_raw
+        else:
+            screen = self._prev_screen
+
         return ContextBrief(
             scene=extract("SCENE") or self._prev_scene,
+            screen=screen,
             memories=self._brief.memories,  # keep existing until updated
             mood_hint=extract("MOOD"),
             speak_directive=extract("DIRECTIVE") or "LISTEN",
