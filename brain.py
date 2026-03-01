@@ -156,6 +156,9 @@ class BrainEngine:
         now = time.monotonic()
         self._last_bot_speech_time = now
         self._recent_bot_texts.append((now, text))
+        # Consume the directive — bot has responded, don't let stale RESPOND
+        # carry over and accidentally trigger on the next audio (e.g. video)
+        self._brief.speak_directive = "LISTEN"
         self._trim_recent()
 
     def get_context_brief(self) -> ContextBrief:
