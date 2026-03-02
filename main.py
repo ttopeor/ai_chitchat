@@ -36,6 +36,7 @@ import torch
 from faster_whisper import WhisperModel
 import httpx
 import config
+import i18n
 
 
 # ── Ollama model lifecycle ────────────────────────────────────────────────────
@@ -210,7 +211,7 @@ class VoiceBot:
         self._tts_spk = self.tts.sample_random_speaker(seed=config.CHATTTS_SEED)
 
         self.history: list[dict] = [
-            {"role": "system", "content": config.SYSTEM_PROMPT}
+            {"role": "system", "content": i18n.T.SYSTEM_PROMPT}
         ]
 
         # threading.Event so both asyncio and OutputStream callback can read/write
@@ -371,7 +372,7 @@ class VoiceBot:
         loop = asyncio.get_running_loop()
 
         def _run() -> str:
-            segs, _ = self.asr.transcribe(audio, beam_size=5, vad_filter=True, language="zh")
+            segs, _ = self.asr.transcribe(audio, beam_size=5, vad_filter=True, language=i18n.T.STT_LANGUAGE)
             return "".join(s.text for s in segs).strip()
 
         return await loop.run_in_executor(None, _run)
@@ -472,7 +473,7 @@ class VoiceBot:
 
         # System prompt with dynamic background injected
         dynamic_bg = self.brain.get_dynamic_background() if self.brain else ""
-        system_prompt = config.SYSTEM_PROMPT.replace("{dynamic_background}", dynamic_bg)
+        system_prompt = i18n.T.SYSTEM_PROMPT.replace("{dynamic_background}", dynamic_bg)
         sys_tokens = _estimate_tokens(system_prompt)
 
         # Build brain context block (truncate each part to control size)
@@ -481,19 +482,18 @@ class VoiceBot:
         if self.brain:
             brief = self.brain.get_context_brief()
             now = datetime.now()
-            _weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-            time_str = f"{now.month}月{now.day}日 {_weekdays[now.weekday()]} {now.hour}:{now.minute:02d}"
-            parts: list[str] = [f"现在是: {time_str}"]
+            time_str = i18n.T.format_date(now)
+            parts: list[str] = [i18n.T.PERCEPTION_TIME.format(time_str=time_str)]
             if brief.scene:
-                parts.append(f"你看到: {brief.scene[:config.CONV_SCENE_MAX_CHARS]}")
+                parts.append(i18n.T.PERCEPTION_SCENE.format(scene=brief.scene[:config.CONV_SCENE_MAX_CHARS]))
             if brief.screen:
-                parts.append(f"屏幕上: {brief.screen[:config.CONV_SCREEN_MAX_CHARS]}")
+                parts.append(i18n.T.PERCEPTION_SCREEN.format(screen=brief.screen[:config.CONV_SCREEN_MAX_CHARS]))
             if brief.conversation_guide:
-                parts.append(f"你的想法: {brief.conversation_guide[:config.CONV_GUIDE_MAX_CHARS]}")
+                parts.append(i18n.T.PERCEPTION_GUIDE.format(guide=brief.conversation_guide[:config.CONV_GUIDE_MAX_CHARS]))
             brain_context = (
-                "【感知】\n"
+                i18n.T.PERCEPTION_HEADER + "\n"
                 + "\n".join(parts)
-                + "\n自然回应，不要说'我看到'、'画面中'。"
+                + "\n" + i18n.T.PERCEPTION_FOOTER
             )
             brain_tokens = _estimate_tokens(brain_context)
 
@@ -729,10 +729,7 @@ class VoiceBot:
         # Truncate long intents to save tokens
         mc = config.CONV_INTENT_MAX_CHARS
         short_intent = intent[:mc] if len(intent) > mc else intent
-        prompt = (
-            f"（你想主动说点什么。想法: {short_intent}。"
-            f"自然简短地说，一两句。）"
-        )
+        prompt = i18n.T.AUTONOMOUS_PROMPT.format(intent=short_intent)
 
         # Build messages — prompt is appended as extra user message
         messages = self._build_messages(extra_user_msg=prompt)
@@ -778,7 +775,7 @@ class VoiceBot:
         await loop.run_in_executor(
             None,
             lambda: self.tts.infer(
-                ["你好世界"],
+                [i18n.T.TTS_WARMUP_TEXT],
                 skip_refine_text=False,
                 params_infer_code={
                     "spk_emb": self._tts_spk,
@@ -861,4 +858,14 @@ class VoiceBot:
 # ── entry point ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="VoiceBot — dual-system voice chat")
+    parser.add_argument("--lang", default="zh", choices=["zh", "en"],
+                        help="Language for prompts and STT (default: zh)")
+    args = parser.parse_args()
+
+    config.LANG = args.lang
+    import i18n
+    i18n.init(args.lang)
+
     asyncio.run(VoiceBot().run())

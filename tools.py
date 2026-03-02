@@ -13,69 +13,51 @@ from datetime import datetime
 from ddgs import DDGS
 
 import config
+import i18n
 
 logger = logging.getLogger(__name__)
 
 # ── Tool definitions (Ollama native format) ─────────────────────────────────
 
-TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_datetime",
-            "description": "获取当前的日期和时间，包括星期几",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
+def get_tool_definitions() -> list[dict]:
+    """Return tool definitions with localized descriptions."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_datetime",
+                "description": i18n.T.TOOL_DATETIME_DESC,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "搜索网络获取实时信息，如天气、新闻、本地商家、价格等",
-            "parameters": {
-                "type": "object",
-                "required": ["query"],
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索查询词",
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": i18n.T.TOOL_SEARCH_DESC,
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": i18n.T.TOOL_SEARCH_QUERY_DESC,
+                        },
                     },
                 },
             },
         },
-    },
-]
+    ]
 
 # ── Tool implementations ────────────────────────────────────────────────────
 
-_WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-
-
 def get_current_datetime() -> str:
-    """Return current date, time, and weekday in Chinese."""
-    now = datetime.now()
-    weekday = _WEEKDAYS[now.weekday()]
-    hour = now.hour
-    minute = now.minute
-    if hour < 6:
-        period = "凌晨"
-    elif hour < 12:
-        period = "上午"
-    elif hour == 12:
-        period = "中午"
-    elif hour < 18:
-        period = "下午"
-    else:
-        period = "晚上"
-    display_hour = hour if hour <= 12 else hour - 12
-    return (
-        f"{now.year}年{now.month}月{now.day}日 {weekday} "
-        f"{period}{display_hour}点{minute:02d}分"
-    )
+    """Return current date, time, and weekday in the active locale."""
+    return i18n.T.format_full_datetime(datetime.now())
 
 
 async def web_search(query: str) -> str:
@@ -88,7 +70,7 @@ async def web_search(query: str) -> str:
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
             if not results:
-                return f"没有找到关于'{query}'的搜索结果。"
+                return i18n.T.TOOL_NO_RESULTS.format(query=query)
             lines = []
             for r in results:
                 title = r.get("title", "")
@@ -97,7 +79,7 @@ async def web_search(query: str) -> str:
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"web_search failed: {e}")
-            return f"搜索'{query}'时出错，请稍后再试。"
+            return i18n.T.TOOL_SEARCH_ERROR.format(query=query)
 
     return await loop.run_in_executor(None, _search)
 
@@ -111,10 +93,10 @@ async def execute_tool(name: str, arguments: dict) -> str:
     elif name == "web_search":
         query = arguments.get("query", "")
         if not query:
-            return "搜索查询不能为空。"
+            return i18n.T.TOOL_EMPTY_QUERY
         return await asyncio.wait_for(
             web_search(query),
             timeout=config.TOOLS_TIMEOUT,
         )
     else:
-        return f"未知工具: {name}"
+        return i18n.T.TOOL_UNKNOWN.format(name=name)

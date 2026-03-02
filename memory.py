@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import httpx
 
 import config
+import i18n
 
 # Ollama native API base
 _OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
@@ -84,31 +85,13 @@ class MemoryManager:
             return []
 
         conv_text = "\n".join(
-            f"{'小悠' if m['role'] == 'assistant' else '对方'}: "
+            f"{i18n.T.BOT_LABEL if m['role'] == 'assistant' else i18n.T.USER_LABEL}: "
             + (m["content"] if isinstance(m["content"], str) else str(m["content"]))
             for m in conversation
             if m["role"] in ("user", "assistant")
         )
 
-        prompt = (
-            "/no_think\n"
-            "你是一个记忆提取助手。分析以下对话，提取值得长期记住的信息。\n\n"
-            "提取标准:\n"
-            "- 对方的个人信息、喜好、习惯\n"
-            "- 重要的事件、计划、约定\n"
-            "- 情绪状态的重大变化\n"
-            "- 对方反复提到的话题\n"
-            "- 不要记录闲聊废话、打招呼、日常寒暄\n"
-            "- 不要记录小悠自己说的信息，只记对方的\n\n"
-            f"对话内容:\n{conv_text}\n\n"
-            "用JSON数组格式回复，每条记忆包含:\n"
-            '{"category": "fact/preference/event/emotion/routine", '
-            '"content": "记忆内容", '
-            '"keywords": ["关键词1", "关键词2"], '
-            '"importance": 1到5的数字}\n\n'
-            "如果没有值得记住的内容，回复空数组 []\n"
-            "只回复JSON，不要其他文字。"
-        )
+        prompt = i18n.T.MEMORY_EXTRACTION_PROMPT.format(conv_text=conv_text)
 
         try:
             result = await self._call_ollama(prompt)
@@ -124,7 +107,7 @@ class MemoryManager:
                 return []
 
             now_str = datetime.now().isoformat()
-            source = f"对话于{datetime.now().strftime('%m月%d日%H:%M')}"
+            source = i18n.T.format_memory_source(datetime.now())
 
             new_entries: list[MemoryEntry] = []
             for d in entries_data:
@@ -286,7 +269,7 @@ class MemoryManager:
         if not memories:
             return ""
         lines = [
-            f"- [{m.category}] {m.content}（{m.source}）"
+            i18n.T.MEMORY_FORMAT.format(category=m.category, content=m.content, source=m.source)
             for m in memories
         ]
         return "\n".join(lines)

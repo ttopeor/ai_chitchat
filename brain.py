@@ -29,6 +29,7 @@ from pathlib import Path
 import httpx
 
 import config
+import i18n
 from memory import MemoryEntry, MemoryManager
 from screen import ScreenCapture
 from tools import web_search
@@ -176,8 +177,7 @@ class BrainEngine:
           5. Conversation timeout → respond (brain stale, fallback)
         """
         # 1. Name mentioned → always respond
-        name_variants = ("小悠", "小優", "小尤", "小游", "小由", "小油")
-        if any(n in text for n in name_variants):
+        if any(n in text for n in i18n.T.NAME_VARIANTS):
             return True
 
         # 2. Brain hasn't had its first think yet — be generous, respond
@@ -242,12 +242,12 @@ class BrainEngine:
 
         # Format memories for the synthesis prompt
         mem_lines = [
-            f"- [{m.category}] {m.content}（{m.source}）"
+            i18n.T.MEMORY_FORMAT.format(category=m.category, content=m.content, source=m.source)
             for m in profile_memories
         ]
         mem_text = "\n".join(mem_lines)
 
-        prompt = config.PROFILE_SYNTHESIS_PROMPT.format(memories=mem_text)
+        prompt = i18n.T.PROFILE_SYNTHESIS_PROMPT.format(memories=mem_text)
 
         try:
             result, _ = await self._call_ollama(prompt)
@@ -370,7 +370,7 @@ class BrainEngine:
         search_match = re.search(r"\[SEARCH\]\s*(.+)", raw)
         if search_match:
             query = search_match.group(1).strip()
-            if query and query != "无":
+            if query and query != i18n.T.NONE_TOKEN:
                 print(f"  {_C}[search]{_R} {query}")
                 try:
                     result = await asyncio.wait_for(
@@ -381,7 +381,7 @@ class BrainEngine:
                     print(f"  {_C}[search]{_R} {query} → {len(result)} chars")
                 except Exception as e:
                     print(f"  {_C}[search error]{_R} {e}")
-                    self._search_result = f"搜索'{query}'时出错了。"
+                    self._search_result = i18n.T.SEARCH_ERROR.format(query=query)
                     self._search_delivered = False
 
         # If we have undelivered search results, inject into guide + INITIATE
@@ -389,12 +389,10 @@ class BrainEngine:
         if self._search_result and not self._search_delivered:
             result_preview = self._search_result[:500]
             brief.conversation_guide = (
-                f"你刚查到了以下信息，用口语简短告诉越哥：\n{result_preview}\n\n"
+                i18n.T.SEARCH_INJECT_GUIDE.format(result=result_preview)
                 + (brief.conversation_guide or "")
             )
-            brief.speak_directive = (
-                f"INITIATE:查到了信息，自然地告诉越哥搜索结果"
-            )
+            brief.speak_directive = i18n.T.SEARCH_INJECT_DIRECTIVE
             self._search_delivered = True
             search_initiated = True
 
@@ -464,7 +462,7 @@ class BrainEngine:
             self._last_media_detected_time = time.monotonic()
 
         # Handle memory notes (cooldown: at most once per 60s)
-        if brief.memory_note and brief.memory_note != "无" and self._memory:
+        if brief.memory_note and brief.memory_note != i18n.T.NONE_TOKEN and self._memory:
             if time.monotonic() - self._last_memory_extract_time > 60:
                 self._last_memory_extract_time = time.monotonic()
                 await self._maybe_extract_memories()
@@ -562,7 +560,7 @@ class BrainEngine:
 
         # Estimate template fixed text (placeholders → empty)
         template_fixed_tokens = _estimate_tokens(
-            config.BRAIN_PROMPT_TEMPLATE.format(
+            i18n.T.BRAIN_PROMPT_TEMPLATE.format(
                 prev_scene="", prev_screen="", transcript="", memories="",
                 silence=0, autonomous_gap=0, search_state="",
             )
@@ -571,13 +569,13 @@ class BrainEngine:
 
         # Prepare prev_scene (cap at 10% of variable budget)
         max_prev_tokens = int(variable_budget * 0.10)
-        prev = self._prev_scene if self._prev_scene else "（第一次观察）"
+        prev = self._prev_scene if self._prev_scene else i18n.T.FIRST_OBSERVATION
         while _estimate_tokens(prev) > max_prev_tokens and len(prev) > 20:
             prev = prev[:int(len(prev) * 0.7)] + "..."
 
         # Prepare prev_screen (cap at 5% of variable budget)
         max_prev_screen_tokens = int(variable_budget * 0.05)
-        prev_scr = self._prev_screen if self._prev_screen else "（第一次观察）"
+        prev_scr = self._prev_screen if self._prev_screen else i18n.T.FIRST_OBSERVATION
         while _estimate_tokens(prev_scr) > max_prev_screen_tokens and len(prev_scr) > 20:
             prev_scr = prev_scr[:int(len(prev_scr) * 0.7)] + "..."
 
@@ -604,18 +602,18 @@ class BrainEngine:
         # Build search state hint for the brain
         search_state = ""
         if self._search_result and not self._search_delivered:
-            search_state = f"【搜索结果待传达】你已查到：{self._search_result[:300]}\n建议用INITIATE把结果告诉越哥。"
+            search_state = i18n.T.SEARCH_RESULT_PENDING.format(result=self._search_result[:300])
         elif self._search_result and self._search_delivered:
-            search_state = "【搜索结果已传达】你之前查到的信息已经告诉越哥了。"
+            search_state = i18n.T.SEARCH_RESULT_DELIVERED
 
-        prompt = config.BRAIN_PROMPT_TEMPLATE.format(
+        prompt = i18n.T.BRAIN_PROMPT_TEMPLATE.format(
             prev_scene=prev,
             prev_screen=prev_scr,
-            transcript=transcript if transcript else "（最近没有对话）",
-            memories=memories if memories else "（暂无记忆）",
+            transcript=transcript if transcript else i18n.T.NO_RECENT_CONVERSATION,
+            memories=memories if memories else i18n.T.NO_MEMORIES,
             silence=silence,
             autonomous_gap=autonomous_gap,
-            search_state=search_state if search_state else "（无待处理的搜索）",
+            search_state=search_state if search_state else i18n.T.NO_PENDING_SEARCH,
         )
 
         # Final safety: hard-truncate if still over budget
@@ -623,7 +621,7 @@ class BrainEngine:
         if total > text_budget:
             # Keep template structure but truncate the assembled text
             target_chars = int(text_budget / 1.5)
-            prompt = prompt[:target_chars] + "\n...(截断)"
+            prompt = prompt[:target_chars] + i18n.T.BRAIN_TRUNCATED
 
         return prompt
 
@@ -638,9 +636,9 @@ class BrainEngine:
         media_str = extract("MEDIA")
         media_playing = media_str.upper().startswith("Y") if media_str else False
 
-        # For screen: treat "无变化" as keeping previous screen state
+        # For screen: treat "no change" / "无变化" as keeping previous screen state
         screen_raw = extract("SCREEN")
-        if screen_raw and screen_raw != "无变化":
+        if screen_raw and screen_raw != i18n.T.NO_CHANGE:
             screen = screen_raw
         else:
             screen = self._prev_screen
@@ -697,17 +695,7 @@ class BrainEngine:
         if len(audio_text) > 4000:
             audio_text = "...\n" + audio_text[-4000:]
 
-        prompt = (
-            "/no_think\n"
-            "以下是对方正在观看的视频/媒体的音频转录内容:\n\n"
-            f"{audio_text}\n\n"
-            "请总结这个视频/媒体的主题和关键内容，用一两句话概括他在看什么。\n"
-            "用JSON数组格式回复，每条记忆包含:\n"
-            '{"category": "media", "content": "他在看一个关于...的视频/节目", '
-            '"keywords": ["关键词1", "关键词2"], "importance": 2}\n\n'
-            "如果内容太碎片化无法总结，回复空数组 []\n"
-            "只回复JSON，不要其他文字。"
-        )
+        prompt = i18n.T.MEDIA_MEMORY_PROMPT.format(audio_text=audio_text)
 
         try:
             result = await self._memory._call_ollama(prompt)
@@ -722,7 +710,7 @@ class BrainEngine:
                 return
 
             now_str = datetime.now().isoformat()
-            source = f"观看视频于{datetime.now().strftime('%m月%d日%H:%M')}"
+            source = i18n.T.format_media_source(datetime.now())
 
             new_entries: list[MemoryEntry] = []
             for d in entries_data:
@@ -755,11 +743,11 @@ class BrainEngine:
         """Merge recent user and bot texts into a chronological transcript."""
         combined: list[tuple[float, str, str]] = []
         for ts, txt in self._recent_user_texts:
-            combined.append((ts, "对方", txt))
+            combined.append((ts, i18n.T.USER_LABEL, txt))
         for ts, txt in self._recent_bot_texts:
-            combined.append((ts, "小悠", txt))
+            combined.append((ts, i18n.T.BOT_LABEL, txt))
         for ts, txt in self._recent_ambient_texts:
-            combined.append((ts, "（视频/背景声）", txt))
+            combined.append((ts, i18n.T.AMBIENT_LABEL, txt))
         combined.sort(key=lambda x: x[0])
         combined = combined[-max_entries:]
 
