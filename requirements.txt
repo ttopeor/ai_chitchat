@@ -5,8 +5,9 @@ numpy
 # STT
 faster-whisper
 
-# LLM (OpenAI-compatible client)
+# LLM
 openai
+pyyaml
 
 # TTS
 chattts-fork

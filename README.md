@@ -30,7 +30,7 @@ Xiao You listens through the microphone, observes through a webcam, watches your
     ||                                            ||
     ||   camera + screen --> scene description    ||
     ||   conversation   --> memory extraction     ||
-    ||   all context    --> speak directive        ||
+    ||   all context    --> speak directive       ||
     ||   user request   --> [SEARCH] web          ||
     ||                                            ||
     ==============|==========|=====================

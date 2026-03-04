@@ -1,9 +1,8 @@
 """
 VoiceBot — dual-system voice chat with vision, memory, and autonomous speech.
 
-  Single model (qwen3.5:122b) with parallel slots:
-    System 1 (conv): real-time conversation — mouth & reflexes
-    System 2 (brain): background thinker — vision, memory, context generation
+  System 1 (conv/mouth): real-time conversation — mouth & reflexes
+  System 2 (brain): background thinker — vision, memory, context generation
 
   STT : faster-whisper  (CUDA)
   TTS : ChatTTS          (CUDA)
@@ -34,69 +33,9 @@ import numpy as np
 import sounddevice as sd
 import torch
 from faster_whisper import WhisperModel
-import httpx
 import config
 import i18n
-
-
-# ── Ollama model lifecycle ────────────────────────────────────────────────────
-
-# Strip "/v1" to get native Ollama API base
-_OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
-
-
-async def _ollama_load(
-    model: str,
-    keep_alive: int | str,
-    num_ctx: int | None = None,
-) -> None:
-    """Load/pin a model in Ollama VRAM with specific keep_alive and context size.
-
-    Uses /api/chat (streaming) and reads the full response to ensure
-    the model is actually loaded before returning.  Passing num_ctx here
-    sets the KV-cache size for the loaded instance — critical for VRAM control.
-    """
-    body: dict = {
-        "model": model,
-        "keep_alive": keep_alive,
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": True,
-    }
-    if num_ctx is not None:
-        body["options"] = {"num_ctx": num_ctx}
-    try:
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                f"{_OLLAMA_BASE}/api/chat",
-                json=body,
-                timeout=httpx.Timeout(connect=10, read=300, write=10, pool=10),
-            ) as resp:
-                resp.raise_for_status()
-                async for _ in resp.aiter_lines():
-                    pass  # drain stream — model loads as we read
-    except Exception as e:
-        print(f"  [Ollama] load({model}) failed: {e}")
-
-
-async def _ollama_unload(model: str) -> None:
-    """Unload a model from Ollama VRAM immediately.
-
-    Uses /api/generate with keep_alive=0 and no prompt — the official way
-    to evict a model without re-loading it with default context.
-    """
-    body = {"model": model, "keep_alive": 0}
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{_OLLAMA_BASE}/api/generate",
-                json=body,
-                timeout=httpx.Timeout(connect=10, read=30, write=10, pool=10),
-            )
-            resp.raise_for_status()
-    except Exception as e:
-        print(f"  [Ollama] unload({model}) failed: {e}")
-
+import llm
 
 from brain import BrainEngine
 from memory import MemoryManager
@@ -112,21 +51,6 @@ _R = "\033[0m"    # reset
 
 _CONV_DETAIL_DIR = Path("logs/conv")
 _CONV_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ── token estimation ─────────────────────────────────────────────────────────
-
-def _estimate_tokens(text: str) -> int:
-    """Token count estimate for Qwen2.5 models (~1.3x safety margin).
-
-    Qwen2.5 tokenizer: CJK ≈ 0.73 tok/char, ASCII ≈ 0.25 tok/char.
-    We use 1.0/0.3 for ~1.3x overestimate to avoid overflow.
-    """
-    if not text:
-        return 0
-    n_cjk = sum(1 for c in text if ord(c) > 0x2E7F)
-    n_other = len(text) - n_cjk
-    return int(n_cjk * 1.0 + n_other * 0.3) + 4   # +4 per-message overhead
 
 
 # ── sentence splitter ─────────────────────────────────────────────────────────
@@ -253,18 +177,16 @@ class VoiceBot:
         self.memory: MemoryManager | None = None
         if config.MEMORY_ENABLED:
             self.memory = MemoryManager(
-                model=config.BRAIN_MODEL,
                 storage_dir=config.MEMORY_DIR,
                 storage_file=config.MEMORY_FILE,
                 max_context=config.MEMORY_MAX_CONTEXT,
                 min_turns=config.MEMORY_EXTRACT_MIN_TURNS,
             )
 
-        # ── Brain (72b background thinker) ────────────────────────────────────
+        # ── Brain (background thinker) ──────────────────────────────────────
         self.brain: BrainEngine | None = None
         if config.BRAIN_ENABLED:
             self.brain = BrainEngine(
-                model=config.BRAIN_MODEL,
                 camera=self.camera,
                 screen=self.screen,
                 memory=self.memory,
@@ -468,13 +390,13 @@ class VoiceBot:
           [system] brain context (scene + guide) ← injected LATE
           [user] latest message (from history or extra_user_msg)
         """
-        budget = config.MODEL_NUM_CTX
+        budget = llm.mouth.context_window
         output_reserve = config.CONV_OUTPUT_RESERVE
 
         # System prompt with dynamic background injected
         dynamic_bg = self.brain.get_dynamic_background() if self.brain else ""
         system_prompt = i18n.T.SYSTEM_PROMPT.replace("{dynamic_background}", dynamic_bg)
-        sys_tokens = _estimate_tokens(system_prompt)
+        sys_tokens = llm.estimate_tokens(system_prompt)
 
         # Build brain context block (truncate each part to control size)
         brain_context = ""
@@ -495,10 +417,10 @@ class VoiceBot:
                 + "\n".join(parts)
                 + "\n" + i18n.T.PERCEPTION_FOOTER
             )
-            brain_tokens = _estimate_tokens(brain_context)
+            brain_tokens = llm.estimate_tokens(brain_context)
 
         # Extra user message for autonomous speech
-        extra_tokens = _estimate_tokens(extra_user_msg) if extra_user_msg else 0
+        extra_tokens = llm.estimate_tokens(extra_user_msg) if extra_user_msg else 0
 
         # Available budget for conversation history
         available = budget - sys_tokens - brain_tokens - extra_tokens - output_reserve
@@ -510,7 +432,7 @@ class VoiceBot:
         used = 0
         dropped = 0
         for msg in reversed(history):
-            msg_tokens = _estimate_tokens(msg["content"])
+            msg_tokens = llm.estimate_tokens(msg["content"])
             if used + msg_tokens > available:
                 dropped += 1
                 continue   # try older messages too — skip long ones
@@ -545,11 +467,8 @@ class VoiceBot:
     async def _stream_and_speak(
         self, messages: list[dict], label: str = "bot"
     ) -> str:
-        """Stream tokens from conv model via native Ollama API, split into sentences, pipe to TTS.
+        """Stream tokens from conv model, split into sentences, pipe to TTS.
         Returns the full generated text.
-
-        Uses /api/chat with num_ctx to prevent Ollama from reloading the model
-        with default 128k context (which would evict both pinned models).
         """
         loop = asyncio.get_running_loop()
         full = ""
@@ -564,51 +483,22 @@ class VoiceBot:
         play_future  = loop.run_in_executor(None, self._playback_worker)
 
         try:
-            body = {
-                "model": config.CONV_MODEL,
-                "messages": messages,
-                "options": {
-                    "num_ctx": config.MODEL_NUM_CTX,
-                    "num_predict": config.CONV_NUM_PREDICT,
-                },
-                "stream": True,
-                "think": False,   # disable thinking at API level (prompt /no_think alone isn't enough)
-            }
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST",
-                    f"{_OLLAMA_BASE}/api/chat",
-                    json=body,
-                    timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
-                ) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+            async for tok in llm.mouth.stream_chat(messages):
+                if tok and t_first_tok is None:
+                    t_first_tok = time.perf_counter()
+                if tok:
+                    print(tok, end="", flush=True)
+                    full += tok
+                    buf  += tok
 
-                        tok = data.get("message", {}).get("content", "")
-                        if tok and t_first_tok is None:
-                            t_first_tok = time.perf_counter()
-                        if tok:
-                            print(tok, end="", flush=True)
-                            full += tok
-                            buf  += tok
+                    sent, buf = pop_sentence(buf)
+                    if sent:
+                        if t_tts_start is None:
+                            t_tts_start = time.perf_counter()
+                        self._synth_q.put(sent)
 
-                            sent, buf = pop_sentence(buf)
-                            if sent:
-                                if t_tts_start is None:
-                                    t_tts_start = time.perf_counter()
-                                self._synth_q.put(sent)
-
-                        if self.interrupt.is_set():
-                            break
-
-                        if data.get("done", False):
-                            break
+                if self.interrupt.is_set():
+                    break
 
             # Flush trailing text
             if buf.strip() and not self.interrupt.is_set():
@@ -644,26 +534,24 @@ class VoiceBot:
                 "tts_play_s": round(tts_elapsed, 2),
             },
             "input": {
-                "model": config.CONV_MODEL,
-                "options": {
-                    "num_ctx": config.MODEL_NUM_CTX,
-                    "num_predict": config.CONV_NUM_PREDICT,
-                },
-                "think": False,
+                "model": llm.mouth.model,
+                "provider": llm.mouth.cfg.provider,
+                "context_window": llm.mouth.context_window,
+                "max_output_tokens": llm.mouth.max_output_tokens,
                 "messages": messages,
                 "token_estimates": {
                     "per_message": [
-                        {"role": m["role"], "tokens": _estimate_tokens(m["content"]), "chars": len(m["content"])}
+                        {"role": m["role"], "tokens": llm.estimate_tokens(m["content"]), "chars": len(m["content"])}
                         for m in messages
                     ],
-                    "total_input": sum(_estimate_tokens(m["content"]) for m in messages),
+                    "total_input": sum(llm.estimate_tokens(m["content"]) for m in messages),
                     "output_reserve": config.CONV_OUTPUT_RESERVE,
-                    "budget": config.MODEL_NUM_CTX,
+                    "budget": llm.mouth.context_window,
                 },
             },
             "output": {
                 "text": full,
-                "tokens_est": _estimate_tokens(full),
+                "tokens_est": llm.estimate_tokens(full),
             },
         }
         log_path = _CONV_DETAIL_DIR / f"{ts}_{self._conv_call_count:04d}_{label}.json"
@@ -690,7 +578,7 @@ class VoiceBot:
             stt_elapsed = time.perf_counter() - t_stt
             print(f"[user] {text}  | STT {_C}{stt_elapsed:.2f}s{_R}")
 
-            # Relevance check: is this speech directed at 小悠?
+            # Relevance check: is this speech directed at the bot?
             if self.brain and not self.brain.should_respond(text):
                 if self.brain.is_media_playing():
                     self.brain.record_media_audio(text)
@@ -787,12 +675,16 @@ class VoiceBot:
         )
         print(f"  ChatTTS ready  | {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
-        # Pin model in VRAM (keep_alive=-1, single model with parallel slots)
+        # Load/pin models via LLM abstraction
         t0 = time.perf_counter()
-        print(f"Loading model ({config.CONV_MODEL}, "
-              f"ctx={config.MODEL_NUM_CTX})…")
-        await _ollama_load(config.CONV_MODEL, -1, config.MODEL_NUM_CTX)
-        print(f"  Model pinned | {_C}{time.perf_counter() - t0:.2f}s{_R}")
+        print(f"Loading mouth model ({llm.mouth.model})…")
+        await llm.mouth.load_model()
+        print(f"  Mouth model ready | {_C}{time.perf_counter() - t0:.2f}s{_R}")
+        if llm.brain.model != llm.mouth.model or llm.brain.cfg.provider != llm.mouth.cfg.provider:
+            t0 = time.perf_counter()
+            print(f"Loading brain model ({llm.brain.model})…")
+            await llm.brain.load_model()
+            print(f"  Brain model ready | {_C}{time.perf_counter() - t0:.2f}s{_R}")
 
         # Start camera
         if self.camera:
@@ -849,10 +741,12 @@ class VoiceBot:
         if self.screen:
             await self.screen.stop()
 
-        # Unload model from VRAM
-        print("Releasing model…")
-        await _ollama_unload(config.CONV_MODEL)
-        print("Model released. Bye!")
+        # Unload models
+        print("Releasing models…")
+        await llm.mouth.unload_model()
+        if llm.brain.model != llm.mouth.model or llm.brain.cfg.provider != llm.mouth.cfg.provider:
+            await llm.brain.unload_model()
+        print("Models released. Bye!")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────────
@@ -868,4 +762,5 @@ if __name__ == "__main__":
     import i18n
     i18n.init(args.lang)
 
+    llm.init()
     asyncio.run(VoiceBot().run())

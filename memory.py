@@ -2,10 +2,8 @@
 MemoryManager — persistent long-term memory for 小悠.
 
 Memories are stored as JSONL (one JSON object per line).  Extraction is done
-by the 72b brain model; retrieval uses keyword + importance scoring to avoid
+by the brain model; retrieval uses keyword + importance scoring to avoid
 recency bias.
-
-Uses Ollama native API (/api/chat) for extraction to ensure num_ctx is passed.
 """
 
 import json
@@ -14,13 +12,9 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 
-import httpx
-
 import config
 import i18n
-
-# Ollama native API base
-_OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
+import llm
 
 
 @dataclass
@@ -31,19 +25,17 @@ class MemoryEntry:
     content: str
     keywords: list[str]
     importance: int        # 1-5
-    source: str            # e.g. "2月27日聊天"
+    source: str            # e.g. "Feb 27 chat"
 
 
 class MemoryManager:
     def __init__(
         self,
-        model: str,
         storage_dir: str = "memories",
         storage_file: str = "memories.jsonl",
         max_context: int = 8,
         min_turns: int = 2,
     ):
-        self._model = model
         self._max_context = max_context
         self._min_turns = min_turns
 
@@ -94,7 +86,7 @@ class MemoryManager:
         prompt = i18n.T.MEMORY_EXTRACTION_PROMPT.format(conv_text=conv_text)
 
         try:
-            result = await self._call_ollama(prompt)
+            result = await self._call_llm(prompt)
             if result is None:
                 return []
 
@@ -134,28 +126,14 @@ class MemoryManager:
             print(f"[Memory] extraction error: {e}")
             return []
 
-    # ── Ollama native API call ────────────────────────────────────────────────
+    # ── LLM call ─────────────────────────────────────────────────────────────
 
-    async def _call_ollama(self, prompt: str) -> str | None:
-        """Call the brain model via native Ollama /api/chat with num_ctx."""
-        body = {
-            "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
-            "options": {"num_ctx": config.MODEL_NUM_CTX},
-            "stream": False,
-            "think": False,
-        }
-
+    async def _call_llm(self, prompt: str) -> str | None:
+        """Call the brain model via the LLM abstraction layer."""
+        messages = [{"role": "user", "content": prompt}]
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{_OLLAMA_BASE}/api/chat",
-                    json=body,
-                    timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return data.get("message", {}).get("content", "").strip()
+            content, _ = await llm.brain.chat(messages)
+            return content
         except Exception as e:
             print(f"[Memory] LLM error: {e}")
             return None

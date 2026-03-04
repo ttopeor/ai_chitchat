@@ -1,0 +1,33 @@
+# ── LLM Configuration ─────────────────────────────────────────────
+# "mouth" = real-time conversation (streaming output, fed to TTS)
+# "brain" = background thinking + memory extraction (non-streaming, supports vision)
+#
+# provider options: "ollama" | "openai"
+#   ollama  — local Ollama server, uses native /api/chat
+#   openai  — OpenAI-compatible API (OpenAI / Together / Groq / vLLM, etc.)
+
+mouth:
+  provider: ollama
+  base_url: "http://10.0.0.190:11434"
+  api_key: ""
+  model: "qwen3.5:122b"
+  context_window: 128000
+  max_output_tokens: 200        # keep short for TTS latency
+  # Ollama-specific (ignored by openai provider):
+  keep_alive: -1                # -1 = pin in VRAM permanently
+  think: false                  # disable chain-of-thought
+
+brain:
+  provider: ollama
+  base_url: "http://10.0.0.190:11434"
+  api_key: ""
+  model: "qwen3.5:122b"
+  context_window: 128000
+  max_output_tokens: 500
+  think: false
+
+# Token estimator: "qwen" | "tiktoken" | "simple"
+#   qwen     — for Qwen models (CJK~1.0, ASCII~0.3 tok/char)
+#   tiktoken — for GPT-4 / Claude models (~0.4 tok/char)
+#   simple   — rough universal fallback (~0.4 tok/char)
+token_estimator: simple

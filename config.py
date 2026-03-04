@@ -2,16 +2,7 @@
 LANG = "zh"   # overridden by --lang CLI argument
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
-LLM_BASE_URL = "http://10.0.0.190:11434/v1"
-LLM_API_KEY  = "ollama"
-
-# 单模型双通道: qwen3.5:122b 同时用于实时对话(嘴)和后台思考(脑)
-# Ollama 服务端需设置: OLLAMA_NUM_PARALLEL=2 (允许同一模型两路并发)
-# main.py 启动时 pin 一次模型 (keep_alive=-1)，退出时释放
-CONV_MODEL    = "qwen3.5:122b"     # 实时对话 (嘴)
-BRAIN_MODEL   = "qwen3.5:122b"    # 后台大脑 (脑) — 同一模型
-MODEL_NUM_CTX = 128000              # 统一 context 窗口 (每个 parallel slot 独立分配)
-# /no_think skips Qwen3 chain-of-thought, keeps responses snappy
+# LLM settings moved to llm_config.yaml (model, provider, api_key, etc.)
 
 # ── STT (faster-whisper) ──────────────────────────────────────────────────────
 WHISPER_MODEL        = "large-v3"   # best accuracy; use "medium" for lower VRAM
@@ -21,8 +12,8 @@ WHISPER_COMPUTE_TYPE = "float16"
 # ── TTS (ChatTTS) ─────────────────────────────────────────────────────────────
 CHATTTS_DEVICE      = "cuda"   # "cuda" or "cpu"
 CHATTTS_TEMPERATURE = 0.3      # lower = more stable output, less random artifacts
-CHATTTS_SEED        = 2     # speaker voice seed — try different values for different voices
-                               # Good seeds for "小悠" voice: 2
+CHATTTS_SEED        = 2        # speaker voice seed — try different values for different voices
+
 # ── Audio I/O ─────────────────────────────────────────────────────────────────
 MIC_SAMPLE_RATE = 16000
 # MIC_DEVICE: None = system default microphone
@@ -44,10 +35,10 @@ CAMERA_WIDTH     = 640
 CAMERA_HEIGHT    = 480
 CAMERA_INTERVAL  = 3.0     # seconds between frame captures
 
-# ── Screen Capture（远程 Windows 屏幕截图）──────────────────────────────────
+# ── Screen Capture (remote Windows screenshot) ───────────────────────────────
 SCREEN_ENABLED   = True
 SCREEN_URL       = "http://10.0.0.70:7890/screenshot"  # Windows screen_server.py
-SCREEN_INTERVAL  = 3.0     # fetch 间隔秒数
+SCREEN_INTERVAL  = 3.0     # fetch interval in seconds
 
 # ── Brain (background thinker) ──────────────────────────────────────────────
 BRAIN_ENABLED           = True
@@ -62,29 +53,28 @@ MEMORY_FILE              = "memories.jsonl"
 MEMORY_MAX_CONTEXT       = 8      # max memories injected into prompt
 MEMORY_EXTRACT_MIN_TURNS = 2      # min user turns before extracting
 
-# ── Token 限制 (嘴 conv 侧) ────────────────────────────────────────────────
-CONV_NUM_PREDICT         = 200    # 唯一硬约束：TTS 延迟。prompt 要求"最多两句话"，200 tok 已是 3-4 句的空间
-CONV_OUTPUT_RESERVE      = 200    # 和 num_predict 保持一致
-CONV_MAX_HISTORY         = 200    # 100轮对话记忆 (~10K tok)，128K下毫无压力
-CONV_SCENE_MAX_CHARS     = 800    # 摄像头场景描述截断上限
-CONV_SCREEN_MAX_CHARS    = 600    # 屏幕内容描述截断上限
-CONV_GUIDE_MAX_CHARS     = 800    # 脑的指导几乎不截断，完整传达脑的意图
-CONV_INTENT_MAX_CHARS    = 400    # 自主发言意图完整保留
+# ── Token limits (mouth / conv) ──────────────────────────────────────────────
+CONV_OUTPUT_RESERVE      = 200    # output token reserve (match mouth.max_output_tokens in llm_config.yaml)
+CONV_MAX_HISTORY         = 200    # 100 turns of conversation (~10K tok), plenty under 128K
+CONV_SCENE_MAX_CHARS     = 800    # camera scene description truncation limit
+CONV_SCREEN_MAX_CHARS    = 600    # screen content description truncation limit
+CONV_GUIDE_MAX_CHARS     = 800    # brain guidance — rarely truncated, preserve full intent
+CONV_INTENT_MAX_CHARS    = 400    # autonomous speech intent — preserve in full
 
-# ── Token 限制 (脑 brain 侧) ───────────────────────────────────────────────
-BRAIN_IMAGE_TOKEN_RESERVE  = 1500   # 不变 — 640x480 JPEG 大小固定
-SCREEN_IMAGE_TOKEN_RESERVE = 1200   # 1280x549 缩放后的屏幕截图
-BRAIN_OUTPUT_TOKEN_RESERVE = 500    # content 输出（thinking 已关闭）
-BRAIN_TRANSCRIPT_ENTRIES   = 40     # 脑看完整对话脉络，不再只看几轮就下判断
-BRAIN_RECENT_MAX_AGE       = 1800   # 脑记住30分钟内的对话
-BRAIN_RECENT_MAX_COUNT     = 100    # 配合 max_age，缓存足够多的对话
+# ── Token limits (brain) ─────────────────────────────────────────────────────
+BRAIN_IMAGE_TOKEN_RESERVE  = 1500   # fixed — 640x480 JPEG size is constant
+SCREEN_IMAGE_TOKEN_RESERVE = 1200   # 1280x549 scaled screenshot
+BRAIN_OUTPUT_TOKEN_RESERVE = 500    # content output (thinking disabled)
+BRAIN_TRANSCRIPT_ENTRIES   = 40     # brain sees full conversation context, not just a few turns
+BRAIN_RECENT_MAX_AGE       = 1800   # brain remembers 30 min of conversation
+BRAIN_RECENT_MAX_COUNT     = 100    # paired with max_age, cache enough conversation entries
 
-# ── 动态背景合成 ──────────────────────────────────────────────────────────
+# ── Dynamic background synthesis ─────────────────────────────────────────────
 # PROFILE_SYNTHESIS_PROMPT moved to i18n/zh.py and i18n/en.py
-PROFILE_MIN_IMPORTANCE     = 3      # 只用 importance >= 3 的记忆来合成背景
+PROFILE_MIN_IMPORTANCE     = 3      # only use memories with importance >= 3 for background synthesis
 
-# ── Tools (网络浏览工具) ──────────────────────────────────────────────────
+# ── Tools (web browsing) ─────────────────────────────────────────────────────
 TOOLS_ENABLED              = True
-TOOLS_MAX_ROUNDS           = 3       # 最多工具调用轮数
-TOOLS_SEARCH_MAX_RESULTS   = 3       # 每次搜索返回结果数
-TOOLS_TIMEOUT              = 10.0    # 工具执行超时（秒）
+TOOLS_MAX_ROUNDS           = 3       # max tool call rounds
+TOOLS_SEARCH_MAX_RESULTS   = 3       # search results per query
+TOOLS_TIMEOUT              = 10.0    # tool execution timeout (seconds)

@@ -1,16 +1,13 @@
 """
-BrainEngine — the 72b "System 2" background thinker.
+BrainEngine — "System 2" background thinker.
 
 Runs a periodic loop that:
   1. Observes the camera (VLM scene description)
   2. Reviews recent conversation
   3. Retrieves relevant memories
-  4. Produces a ContextBrief for the 7b conversation model
+  4. Produces a ContextBrief for the conversation model
   5. Decides whether to initiate autonomous speech
   6. Triggers memory extraction at conversation boundaries
-
-Uses Ollama native API (/api/chat) instead of OpenAI-compatible API
-to ensure num_ctx is always passed — prevents 128k default VRAM explosion.
 
 Logs every think cycle to logs/brain/ for debugging.
 """
@@ -26,10 +23,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import httpx
-
 import config
 import i18n
+import llm
 from memory import MemoryEntry, MemoryManager
 from screen import ScreenCapture
 from tools import web_search
@@ -39,28 +35,12 @@ from vision import CameraCapture
 _C = "\033[35m"   # magenta for brain logs
 _R = "\033[0m"
 
-# Ollama native API base (strip /v1 from OpenAI-compat URL)
-_OLLAMA_BASE = config.LLM_BASE_URL.removesuffix("/v1").removesuffix("/")
-
 # Log directory
 _LOG_DIR = Path("logs/brain")
 
 # Token reserves (read from config)
 _IMAGE_TOKEN_RESERVE = config.BRAIN_IMAGE_TOKEN_RESERVE
 _OUTPUT_TOKEN_RESERVE = config.BRAIN_OUTPUT_TOKEN_RESERVE
-
-
-def _estimate_tokens(text: str) -> int:
-    """Token count estimate for Qwen2.5 models (~1.3x safety margin).
-
-    Qwen2.5 tokenizer: CJK ≈ 0.73 tok/char, ASCII ≈ 0.25 tok/char.
-    We use 1.0/0.3 for ~1.3x overestimate to avoid overflow.
-    """
-    if not text:
-        return 0
-    n_cjk = sum(1 for c in text if ord(c) > 0x2E7F)
-    n_other = len(text) - n_cjk
-    return int(n_cjk * 1.0 + n_other * 0.3) + 4
 
 
 @dataclass
@@ -81,7 +61,6 @@ class ContextBrief:
 class BrainEngine:
     def __init__(
         self,
-        model: str,
         camera: CameraCapture | None,
         screen: ScreenCapture | None,
         memory: MemoryManager | None,
@@ -92,7 +71,6 @@ class BrainEngine:
         autonomous_cooldown: float = 120.0,
         conversation_timeout: float = 30.0,
     ):
-        self._model = model
         self._camera = camera
         self._screen = screen
         self._memory = memory
@@ -250,7 +228,7 @@ class BrainEngine:
         prompt = i18n.T.PROFILE_SYNTHESIS_PROMPT.format(memories=mem_text)
 
         try:
-            result, _ = await self._call_ollama(prompt)
+            result, _ = await self._call_llm(prompt)
             if result and len(result.strip()) > 5:
                 self._dynamic_background = result.strip()
                 print(f"[Brain] Dynamic background synthesized ({len(self._dynamic_background)} chars)")
@@ -272,7 +250,7 @@ class BrainEngine:
         - Idle < 2 min: normal interval (BRAIN_INTERVAL, default 20s)
         - Idle > 2 min: slow mode (60s)
         """
-        print(f"[Brain] Started (model={self._model})")
+        print(f"[Brain] Started (model={llm.brain.model})")
         print(f"[Brain] Logs → {_LOG_DIR.resolve()}/")
 
         while True:
@@ -359,7 +337,7 @@ class BrainEngine:
             img_path.write_bytes(base64.b64decode(screen_b64))
 
         # Call model via native Ollama API
-        raw, thinking = await self._call_ollama(prompt, images or None)
+        raw, thinking = await self._call_llm(prompt, images or None)
         if raw is None:
             return
 
@@ -404,7 +382,7 @@ class BrainEngine:
             image_tok += _IMAGE_TOKEN_RESERVE
         if screen_b64:
             image_tok += config.SCREEN_IMAGE_TOKEN_RESERVE
-        prompt_tokens = _estimate_tokens(prompt) + image_tok
+        prompt_tokens = llm.estimate_tokens(prompt) + image_tok
         guide_preview = brief.conversation_guide[:80] if brief.conversation_guide else ""
         print(f"[Brain] #{self._think_count} {_C}{elapsed:.1f}s{_R} "
               f"| ~{prompt_tokens}tok "
@@ -422,8 +400,8 @@ class BrainEngine:
             "cycle": self._think_count,
             "elapsed_s": round(elapsed, 2),
             "input": {
-                "model": self._model,
-                "options": {"num_ctx": config.MODEL_NUM_CTX},
+                "model": llm.brain.model,
+                "options": {"num_ctx": llm.brain.context_window},
                 "think": False,
                 "prompt": prompt,
                 "has_image": bool(frame_b64),
@@ -431,18 +409,18 @@ class BrainEngine:
                 "image_file": f"{log_prefix}_input.jpg" if frame_b64 else None,
                 "screen_file": f"{log_prefix}_screen.jpg" if screen_b64 else None,
                 "token_estimates": {
-                    "prompt": _estimate_tokens(prompt),
+                    "prompt": llm.estimate_tokens(prompt),
                     "image_reserve": image_tok,
                     "output_reserve": _OUTPUT_TOKEN_RESERVE,
                     "total_input": prompt_tokens,
-                    "budget": config.MODEL_NUM_CTX,
+                    "budget": llm.brain.context_window,
                 },
             },
             "output": {
                 "raw": raw,
                 "thinking": thinking,
-                "tokens_est": _estimate_tokens(raw),
-                "thinking_tokens_est": _estimate_tokens(thinking) if thinking else 0,
+                "tokens_est": llm.estimate_tokens(raw),
+                "thinking_tokens_est": llm.estimate_tokens(thinking) if thinking else 0,
                 "parsed": {
                     "scene": brief.scene,
                     "screen": brief.screen,
@@ -495,42 +473,19 @@ class BrainEngine:
         async with self._lock:
             self._brief = brief
 
-    # ── Ollama native API call ───────────────────────────────────────────────
+    # ── LLM call ─────────────────────────────────────────────────────────────
 
-    async def _call_ollama(
+    async def _call_llm(
         self, prompt: str, images: list[str] | None = None
     ) -> tuple[str | None, str]:
-        """Call the brain model via Ollama native /api/chat.
+        """Call the brain model via the LLM abstraction layer.
 
         Returns (content, thinking) tuple. thinking contains the model's
         chain-of-thought reasoning (empty string if none).
         """
-        msg: dict = {"role": "user", "content": prompt}
-        if images:
-            msg["images"] = images
-        messages = [msg]
-
-        body = {
-            "model": self._model,
-            "messages": messages,
-            "options": {"num_ctx": config.MODEL_NUM_CTX},
-            "stream": False,
-            "think": False,
-        }
-
+        messages = [{"role": "user", "content": prompt}]
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{_OLLAMA_BASE}/api/chat",
-                    json=body,
-                    timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                msg = data.get("message", {})
-                content = msg.get("content", "").strip()
-                thinking = msg.get("thinking", "").strip()
-                return content, thinking
+            return await llm.brain.chat(messages, images)
         except Exception as e:
             print(f"[Brain] LLM error: {e}")
             return None, ""
@@ -556,10 +511,10 @@ class BrainEngine:
             image_tokens += _IMAGE_TOKEN_RESERVE                # camera
         if num_images >= 2:
             image_tokens += config.SCREEN_IMAGE_TOKEN_RESERVE   # screen
-        text_budget = config.MODEL_NUM_CTX - image_tokens - _OUTPUT_TOKEN_RESERVE
+        text_budget = llm.brain.context_window - image_tokens - _OUTPUT_TOKEN_RESERVE
 
         # Estimate template fixed text (placeholders → empty)
-        template_fixed_tokens = _estimate_tokens(
+        template_fixed_tokens = llm.estimate_tokens(
             i18n.T.BRAIN_PROMPT_TEMPLATE.format(
                 prev_scene="", prev_screen="", transcript="", memories="",
                 silence=0, autonomous_gap=0, search_state="",
@@ -570,19 +525,19 @@ class BrainEngine:
         # Prepare prev_scene (cap at 10% of variable budget)
         max_prev_tokens = int(variable_budget * 0.10)
         prev = self._prev_scene if self._prev_scene else i18n.T.FIRST_OBSERVATION
-        while _estimate_tokens(prev) > max_prev_tokens and len(prev) > 20:
+        while llm.estimate_tokens(prev) > max_prev_tokens and len(prev) > 20:
             prev = prev[:int(len(prev) * 0.7)] + "..."
 
         # Prepare prev_screen (cap at 5% of variable budget)
         max_prev_screen_tokens = int(variable_budget * 0.05)
         prev_scr = self._prev_screen if self._prev_screen else i18n.T.FIRST_OBSERVATION
-        while _estimate_tokens(prev_scr) > max_prev_screen_tokens and len(prev_scr) > 20:
+        while llm.estimate_tokens(prev_scr) > max_prev_screen_tokens and len(prev_scr) > 20:
             prev_scr = prev_scr[:int(len(prev_scr) * 0.7)] + "..."
 
         # Prepare transcript (50% of variable budget, keep most recent)
         max_transcript_tokens = int(variable_budget * 0.5)
         if transcript:
-            while _estimate_tokens(transcript) > max_transcript_tokens and len(transcript) > 50:
+            while llm.estimate_tokens(transcript) > max_transcript_tokens and len(transcript) > 50:
                 lines = transcript.split("\n")
                 if len(lines) > 2:
                     transcript = "...\n" + "\n".join(lines[2:])
@@ -592,7 +547,7 @@ class BrainEngine:
         # Prepare memories (25% of variable budget)
         max_memory_tokens = int(variable_budget * 0.25)
         if memories:
-            while _estimate_tokens(memories) > max_memory_tokens and len(memories) > 30:
+            while llm.estimate_tokens(memories) > max_memory_tokens and len(memories) > 30:
                 lines = memories.split("\n")
                 if len(lines) > 1:
                     memories = "\n".join(lines[:-1]) + "\n..."
@@ -617,7 +572,7 @@ class BrainEngine:
         )
 
         # Final safety: hard-truncate if still over budget
-        total = _estimate_tokens(prompt)
+        total = llm.estimate_tokens(prompt)
         if total > text_budget:
             # Keep template structure but truncate the assembled text
             target_chars = int(text_budget / 1.5)
@@ -636,7 +591,7 @@ class BrainEngine:
         media_str = extract("MEDIA")
         media_playing = media_str.upper().startswith("Y") if media_str else False
 
-        # For screen: treat "no change" / "无变化" as keeping previous screen state
+        # For screen: treat "no change" as keeping previous screen state
         screen_raw = extract("SCREEN")
         if screen_raw and screen_raw != i18n.T.NO_CHANGE:
             screen = screen_raw
@@ -698,7 +653,7 @@ class BrainEngine:
         prompt = i18n.T.MEDIA_MEMORY_PROMPT.format(audio_text=audio_text)
 
         try:
-            result = await self._memory._call_ollama(prompt)
+            result = await self._memory._call_llm(prompt)
             if result is None:
                 return
 

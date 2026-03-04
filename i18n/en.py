@@ -8,7 +8,7 @@ BOT_NAME = "Xiao You"
 USER_LABEL = "User"
 BOT_LABEL = "Xiao You"
 AMBIENT_LABEL = "(video/background audio)"
-NAME_VARIANTS = ("Xiao You", "XiaoYou", "xiaoyou", "Xiao you", "xiao you", "小悠")
+NAME_VARIANTS = ("Xiao You", "XiaoYou", "xiaoyou", "Xiao you", "xiao you", "Xiaoyou", "小悠")
 
 # ── STT / TTS ─────────────────────────────────────────────────────────────────
 
