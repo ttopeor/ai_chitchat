@@ -123,24 +123,31 @@ mouth:
   keep_alive: -1                        # Ollama 专用：常驻显存
   think: false                          # Ollama 专用：关闭思维链
 
-# 脑：后台思考 + 记忆提取（非流式）
+# 脑：后台思考 + 记忆提取（非流式，带视觉）
 brain:
-  provider: openai                      # OpenAI 兼容 API
-  base_url: "https://api.deepseek.com"
-  api_key: "${DEEPSEEK_API_KEY}"        # 从环境变量读取
-  model: "deepseek-chat"
-  context_window: 65536
+  provider: openai
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+  api_key: "${GEMINI_API_KEY}"
+  model: "gemini-3-flash-preview"
+  context_window: 1000000
   max_output_tokens: 500
+  vision: true                          # 不支持图片的模型设为 false
 
 token_estimator: simple   # "qwen" | "tiktoken" | "simple"
 ```
 
-`openai` provider 兼容所有 OpenAI 格式的端点（OpenAI、DeepSeek、Together、Groq、vLLM 等）。
+`openai` provider 兼容所有 OpenAI 格式的端点（OpenAI、Gemini、DeepSeek、Together、Groq、vLLM 等）。`base_url` 需要包含版本路径：
 
-API key 支持 `${ENV_VAR}` 语法，启动时从环境变量解析。在 `.bashrc` 或 `.env` 中设置：
+| Provider | base_url |
+|----------|----------|
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| DeepSeek | `https://api.deepseek.com/v1` |
+| OpenAI | `https://api.openai.com/v1` |
+
+API key 支持 `${ENV_VAR}` 语法，启动时从环境变量解析：
 
 ```bash
-export DEEPSEEK_API_KEY="sk-..."
+export GEMINI_API_KEY="..."
 ```
 
 **如果使用 Ollama**，请确保 Ollama 已安装并运行。如果嘴和脑都用同一个 Ollama 模型，需要启用双通道并行推理：

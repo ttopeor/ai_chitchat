@@ -4,9 +4,13 @@
 #
 # provider options: "ollama" | "openai"
 #   ollama  — local Ollama server, uses native /api/chat
-#   openai  — OpenAI-compatible API (OpenAI / Together / Groq / vLLM, etc.)
+#   openai  — OpenAI-compatible API (OpenAI / DeepSeek / Gemini / Together / Groq, etc.)
 #
 # api_key supports ${ENV_VAR} syntax, resolved from environment at startup.
+# base_url for openai provider: include version path, e.g.
+#   DeepSeek:  https://api.deepseek.com/v1
+#   Gemini:    https://generativelanguage.googleapis.com/v1beta/openai
+#   OpenAI:    https://api.openai.com/v1
 
 mouth:
   provider: ollama
@@ -21,11 +25,12 @@ mouth:
 
 brain:
   provider: openai
-  base_url: "https://api.deepseek.com"
-  api_key: "${DEEPSEEK_API_KEY}"
-  model: "deepseek-chat"
-  context_window: 65536
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+  api_key: "${GEMINI_API_KEY}"
+  model: "gemini-3-flash-preview"
+  context_window: 1000000
   max_output_tokens: 500
+  vision: true
 
 # Token estimator: "qwen" | "tiktoken" | "simple"
 #   qwen     — for Qwen models (CJK~1.0, ASCII~0.3 tok/char)

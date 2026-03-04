@@ -36,6 +36,7 @@ class LLMConfig:
     max_output_tokens: int
     keep_alive: int | str = -1      # Ollama only
     think: bool = False              # Ollama only
+    vision: bool = True              # set False to skip image inputs
     extra: dict = field(default_factory=dict)
 
 
@@ -89,6 +90,8 @@ class OllamaClient(LLMClient):
         messages: list[dict],
         images: list[str] | None = None,
     ) -> tuple[str, str]:
+        if not self.cfg.vision:
+            images = None
         if images and messages:
             # Inject images into the last user message (Ollama native format)
             msgs = [m.copy() for m in messages]
@@ -195,7 +198,7 @@ class OllamaClient(LLMClient):
             print(f"  [Ollama] unload({self.model}) failed: {e}")
 
 
-# ── OpenAI-compatible (/v1/chat/completions) ────────────────────────────────
+# ── OpenAI-compatible ─────────────────────────────────────────────────────
 
 class OpenAICompatClient(LLMClient):
 
@@ -231,6 +234,8 @@ class OpenAICompatClient(LLMClient):
         messages: list[dict],
         images: list[str] | None = None,
     ) -> tuple[str, str]:
+        if not self.cfg.vision:
+            images = None
         if images and messages:
             messages = self._convert_images(messages, images)
 
@@ -243,7 +248,7 @@ class OpenAICompatClient(LLMClient):
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self._base}/v1/chat/completions",
+                f"{self._base}/chat/completions",
                 json=body,
                 headers=self._headers,
                 timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
@@ -270,7 +275,7 @@ class OpenAICompatClient(LLMClient):
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST",
-                f"{self._base}/v1/chat/completions",
+                f"{self._base}/chat/completions",
                 json=body,
                 headers=self._headers,
                 timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
@@ -330,7 +335,7 @@ def _resolve_env(value: str) -> str:
 def _parse_section(section: dict) -> LLMConfig:
     known_keys = {
         "provider", "base_url", "api_key", "model",
-        "context_window", "max_output_tokens", "keep_alive", "think",
+        "context_window", "max_output_tokens", "keep_alive", "think", "vision",
     }
     return LLMConfig(
         provider=section.get("provider", "ollama"),
@@ -341,6 +346,7 @@ def _parse_section(section: dict) -> LLMConfig:
         max_output_tokens=section.get("max_output_tokens", 500),
         keep_alive=section.get("keep_alive", -1),
         think=section.get("think", False),
+        vision=section.get("vision", True),
         extra={k: v for k, v in section.items() if k not in known_keys},
     )
 

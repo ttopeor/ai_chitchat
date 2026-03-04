@@ -123,24 +123,31 @@ mouth:
   keep_alive: -1                        # Ollama-only: pin model in VRAM
   think: false                          # Ollama-only: disable chain-of-thought
 
-# Brain: background thinking + memory extraction (non-streaming)
+# Brain: background thinking + memory extraction (non-streaming, vision)
 brain:
-  provider: openai                      # OpenAI-compatible API
-  base_url: "https://api.deepseek.com"
-  api_key: "${DEEPSEEK_API_KEY}"        # resolved from environment variable
-  model: "deepseek-chat"
-  context_window: 65536
+  provider: openai
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+  api_key: "${GEMINI_API_KEY}"
+  model: "gemini-3-flash-preview"
+  context_window: 1000000
   max_output_tokens: 500
+  vision: true                          # set false for models without image support
 
 token_estimator: simple   # "qwen" | "tiktoken" | "simple"
 ```
 
-The `openai` provider works with any OpenAI-compatible endpoint (OpenAI, DeepSeek, Together, Groq, vLLM, etc.).
+The `openai` provider works with any OpenAI-compatible endpoint (OpenAI, Gemini, DeepSeek, Together, Groq, vLLM, etc.). Set `base_url` to include the version path:
 
-API keys support `${ENV_VAR}` syntax — the value is resolved from environment variables at startup. Set them in your `.bashrc` or `.env`:
+| Provider | base_url |
+|----------|----------|
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| DeepSeek | `https://api.deepseek.com/v1` |
+| OpenAI | `https://api.openai.com/v1` |
+
+API keys support `${ENV_VAR}` syntax — resolved from environment variables at startup:
 
 ```bash
-export DEEPSEEK_API_KEY="sk-..."
+export GEMINI_API_KEY="..."
 ```
 
 **If using Ollama**, make sure Ollama is installed and running. If both mouth and brain use the same Ollama model, enable dual-slot parallel inference:
