@@ -2,7 +2,7 @@
 
 # ai_chitchat — 小悠
 
-一个有视觉、记忆和自主意识的本地语音聊天伙伴。
+一个有视觉、记忆和自主意识的语音聊天伙伴。
 
 小悠通过麦克风听你说话、用摄像头观察环境、看你的电脑屏幕、用声音回复你。她能记住跨会话的重要事情，能上网搜索信息，也能在合适的时机主动开口——不只是一个被动回答问题的语音助手。
 
@@ -18,7 +18,7 @@
 
 **双系统思考** — 灵感来自人脑的 System 1 / System 2 理论。一个快系统负责即时反应，一个慢系统在后台持续观察、思考、决策。快系统保证对话流畅，慢系统保证回复有深度。
 
-**完全本地** — 所有模型推理在本地 GPU 上完成，语音、图像、对话内容不上传任何外部服务（网络搜索除外）。
+**灵活的 LLM 后端** — 嘴（对话）和脑（思考）可以各自使用不同的 provider 和模型。全部用 Ollama 本地跑、脑用云端 API、或者全部走云端——在 `llm_config.yaml` 中自由搭配。
 
 ## 双系统架构
 
@@ -47,10 +47,10 @@
     =============================================
 ```
 
-- **嘴（快系统）**：负责实时对话，接收大脑消化好的 ContextBrief（场景、情绪、指导、搜索结果），直接生成回复并语音输出
+- **嘴（快系统）**：负责实时对话，接收大脑消化好的 ContextBrief（场景、情绪、指导、搜索结果），通过流式 LLM + TTS 管线生成语音回复
 - **脑（慢系统）**：在后台持续观察摄像头和屏幕、分析对话、检索记忆、发起网络搜索，把消化好的场景理解和对话指导喂给嘴
 
-两个系统通过 Ollama 的 `OLLAMA_NUM_PARALLEL=2` 实现同一模型双通道并行推理，互不阻塞。
+嘴和脑是独立的 LLM 客户端。两者使用同一个 Ollama 模型时，通过 `OLLAMA_NUM_PARALLEL=2` 双通道并行推理互不阻塞。两者使用不同 provider 时（比如嘴用本地 Ollama，脑用云端 API），则完全独立运行。
 
 ## 实现特点
 
@@ -72,7 +72,7 @@
 
 | 组件 | 技术 |
 |------|------|
-| LLM | qwen3.5:122b (Ollama, 双通道并行) |
+| LLM | Ollama（本地）或 OpenAI 兼容 API（云端）— 按系统独立配置 |
 | STT | faster-whisper (large-v3, CUDA) |
 | TTS | ChatTTS (CUDA) |
 | VAD | Silero VAD |
@@ -82,35 +82,16 @@
 
 ## 系统要求
 
-- **GPU**：NVIDIA GPU，96GB+ 显存（双通道 122b 模型 + STT/TTS/VAD）
+- **GPU**：NVIDIA GPU，需要 CUDA 支持（PyTorch CUDA 12.8）。显存取决于模型选择——大型本地模型（如 122b）需要 96GB+；将脑卸载到云端 API 可显著降低显存需求。
 - **系统**：Linux，PipeWire 音频
-- **CUDA**：需要 CUDA 支持（PyTorch CUDA 12.8）
-- **Ollama**：已安装并运行 Ollama 服务
+- **Ollama**：仅在使用 Ollama 作为 provider 时需要
 - **麦克风**：USB 麦克风或系统默认音频输入
 - **摄像头**：USB 摄像头（可选，可在 `config.py` 中关闭）
 - **Windows 机器**：运行 `screen_server.py` 提供屏幕截图（可选）
 
 ## 安装与设置
 
-### 1. 配置 Ollama 服务端
-
-双通道并行推理需要 Ollama 允许同一模型多路并发：
-
-```bash
-# /etc/systemd/system/ollama.service 的 [Service] 段加:
-Environment="OLLAMA_NUM_PARALLEL=2"
-
-sudo systemctl daemon-reload
-sudo systemctl restart ollama
-```
-
-拉取模型：
-
-```bash
-ollama pull qwen3.5:122b
-```
-
-### 2. 安装项目
+### 1. 安装项目
 
 ```bash
 git clone <repo-url>
@@ -126,13 +107,65 @@ bash setup.sh
 
 ChatTTS 模型（~1GB）会在首次运行时自动下载。
 
+### 2. 配置 LLM Provider
+
+编辑 `llm_config.yaml`，分别设置嘴和脑：
+
+```yaml
+# 嘴：实时对话（流式输出，喂给 TTS）
+mouth:
+  provider: ollama                      # "ollama" 或 "openai"
+  base_url: "http://localhost:11434"
+  api_key: ""
+  model: "qwen3:32b"
+  context_window: 128000
+  max_output_tokens: 200
+  keep_alive: -1                        # Ollama 专用：常驻显存
+  think: false                          # Ollama 专用：关闭思维链
+
+# 脑：后台思考 + 记忆提取（非流式）
+brain:
+  provider: openai                      # OpenAI 兼容 API
+  base_url: "https://api.deepseek.com"
+  api_key: "${DEEPSEEK_API_KEY}"        # 从环境变量读取
+  model: "deepseek-chat"
+  context_window: 65536
+  max_output_tokens: 500
+
+token_estimator: simple   # "qwen" | "tiktoken" | "simple"
+```
+
+`openai` provider 兼容所有 OpenAI 格式的端点（OpenAI、DeepSeek、Together、Groq、vLLM 等）。
+
+API key 支持 `${ENV_VAR}` 语法，启动时从环境变量解析。在 `.bashrc` 或 `.env` 中设置：
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+**如果使用 Ollama**，请确保 Ollama 已安装并运行。如果嘴和脑都用同一个 Ollama 模型，需要启用双通道并行推理：
+
+```bash
+# /etc/systemd/system/ollama.service 的 [Service] 段加:
+Environment="OLLAMA_NUM_PARALLEL=2"
+
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+拉取模型：
+
+```bash
+ollama pull qwen3:32b
+```
+
 ### 3. 配置（可选）
 
-编辑 `config.py` 按需调整：
+编辑 `config.py` 调整非 LLM 设置：
 
-- `LLM_BASE_URL` — Ollama 服务地址（默认 `http://10.0.0.190:11434/v1`）
 - `MIC_DEVICE` / `SPEAKER_DEVICE` — 音频设备（`None` = 系统默认）
 - `CAMERA_ENABLED` / `SCREEN_ENABLED` / `BRAIN_ENABLED` / `MEMORY_ENABLED` / `TOOLS_ENABLED` — 功能开关
+- VAD 阈值、大脑时序、记忆限制、token 预算等
 
 查看可用音频设备：
 
@@ -175,19 +208,21 @@ python main.py
 python main.py --lang en
 ```
 
-退出时按 Ctrl+C，模型显存会自动释放。
+退出时按 Ctrl+C，Ollama 模型显存会自动释放。
 
 ## 项目结构
 
 ```
 ai_chitchat/
 ├── main.py            # 主入口，VoiceBot 编排，音频管线
-├── config.py          # 所有配置：模型、音频、视觉、大脑、记忆、工具
+├── llm.py             # LLM 抽象层（Ollama + OpenAI 兼容）
+├── llm_config.yaml    # LLM provider/模型配置（嘴和脑独立）
+├── config.py          # 非 LLM 配置：音频、视觉、大脑时序、记忆、工具
 ├── brain.py           # BrainEngine — 后台大脑，ContextBrief 生成，搜索调度
 ├── memory.py          # MemoryManager — 持久记忆，提取、检索与整合
 ├── vision.py          # CameraCapture — USB 摄像头后台采集
 ├── screen.py          # ScreenCapture — 远程 Windows 屏幕截图获取
-├── screen_server.py   # Windows 端屏幕截图 HTTP 服务（在 Windows 上运行）
+├── screen_server.py   # Windows 端屏幕截图 HTTP 服务
 ├── tools.py           # 工具定义与执行（时间查询、DuckDuckGo 搜索）
 ├── i18n/              # 国际化字符串（中文/英文）
 ├── setup.sh           # 一键安装脚本

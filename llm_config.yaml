@@ -5,6 +5,8 @@
 # provider options: "ollama" | "openai"
 #   ollama  — local Ollama server, uses native /api/chat
 #   openai  — OpenAI-compatible API (OpenAI / Together / Groq / vLLM, etc.)
+#
+# api_key supports ${ENV_VAR} syntax, resolved from environment at startup.
 
 mouth:
   provider: ollama
@@ -20,7 +22,7 @@ mouth:
 brain:
   provider: openai
   base_url: "https://api.deepseek.com"
-  api_key: ""
+  api_key: "${DEEPSEEK_API_KEY}"
   model: "deepseek-chat"
   context_window: 65536
   max_output_tokens: 500

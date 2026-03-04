@@ -1,7 +1,6 @@
 # Project-specific
 CosyVoice/
 pretrained_models/
-llm_config.yaml
 
 logs
 memories

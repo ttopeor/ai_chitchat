@@ -13,6 +13,8 @@ Call sites:
 from __future__ import annotations
 
 import json
+import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -320,6 +322,11 @@ mouth: LLMClient | None = None
 brain: LLMClient | None = None
 
 
+def _resolve_env(value: str) -> str:
+    """Replace ${VAR} patterns with environment variable values."""
+    return re.sub(r'\$\{(\w+)\}', lambda m: os.environ.get(m.group(1), ""), value)
+
+
 def _parse_section(section: dict) -> LLMConfig:
     known_keys = {
         "provider", "base_url", "api_key", "model",
@@ -328,7 +335,7 @@ def _parse_section(section: dict) -> LLMConfig:
     return LLMConfig(
         provider=section.get("provider", "ollama"),
         base_url=section.get("base_url", "").rstrip("/"),
-        api_key=section.get("api_key", ""),
+        api_key=_resolve_env(section.get("api_key", "")),
         model=section["model"],
         context_window=section.get("context_window", 128000),
         max_output_tokens=section.get("max_output_tokens", 500),
