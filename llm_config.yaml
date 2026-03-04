@@ -18,13 +18,12 @@ mouth:
   think: false                  # disable chain-of-thought
 
 brain:
-  provider: ollama
-  base_url: "http://10.0.0.190:11434"
+  provider: openai
+  base_url: "https://api.deepseek.com"
   api_key: ""
-  model: "qwen3.5:122b"
-  context_window: 128000
+  model: "deepseek-chat"
+  context_window: 65536
   max_output_tokens: 500
-  think: false
 
 # Token estimator: "qwen" | "tiktoken" | "simple"
 #   qwen     — for Qwen models (CJK~1.0, ASCII~0.3 tok/char)
